@@ -1,0 +1,3654 @@
+# this is the code im talking about
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+# ============================================================
+# Joe's System Services (JSS)
+# Remote admin GUI
+# - Welcome tab
+# - System Info tab (now with Send Popup Messages)
+# - General tab
+# - Delete User Profile tab
+# - Enable BitLocker tab
+# - Account Management tab
+# ============================================================
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# -----------------------------
+# Global state
+# -----------------------------
+$script:AdminCredential = $null
+$script:AppName = "Joe's System Services"
+$script:Version = "2.0"
+$script:DefaultHeaderColor = [System.Drawing.Color]::FromArgb(86, 144, 133)
+$script:DefaultAccentColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$script:HeaderColor = $script:DefaultHeaderColor
+$script:AccentColor = $script:DefaultAccentColor
+$script:IsDarkMode = $false
+$script:IsApplyingSettingsProfile = $false
+$script:ApplyThemeClickCount = 0
+$script:SecretUnlocked = $false
+$script:SecretTabCreated = $false
+$script:CookieCount = 0.0
+$script:CookiesPerClick = 1.0
+$script:CookiesPerSecond = 0.0
+$script:CookieCritChance = 0.0
+$script:CookieCritMultiplier = 2.0
+$script:CookiePrestigeCount = 0
+$script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
+$script:CookieAscensionPoints = 0
+$script:CookieAscensionTree = @{ Click = 0; Automation = 0; Economy = 0; Luck = 0 }
+$script:CookieSeenMilestones = @{}
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory)] [string]$Message,
+        [ValidateSet('Info','Warn','Error','Success')] [string]$Level = 'Info'
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$timestamp] [$Level] $Message"
+
+    if ($script:txtLog) {
+        $script:txtLog.AppendText($line + [Environment]::NewLine)
+        $script:txtLog.SelectionStart = $script:txtLog.Text.Length
+        $script:txtLog.ScrollToCaret()
+    }
+}
+
+function Show-Error {
+    param([string]$Message)
+    [System.Windows.Forms.MessageBox]::Show($Message, $script:AppName, 'OK', 'Error') | Out-Null
+    Write-Log -Message $Message -Level Error
+}
+
+function Show-Info {
+    param([string]$Message)
+    [System.Windows.Forms.MessageBox]::Show($Message, $script:AppName, 'OK', 'Information') | Out-Null
+    Write-Log -Message $Message -Level Info
+}
+
+function Show-YesNo {
+    param([string]$Message)
+    return [System.Windows.Forms.MessageBox]::Show($Message, $script:AppName, 'YesNo', 'Question')
+}
+
+function Get-UserSettingsRootPath {
+    $settingsRoot = Join-Path $env:APPDATA 'JSS'
+    if (-not (Test-Path -Path $settingsRoot)) {
+        [void](New-Item -Path $settingsRoot -ItemType Directory -Force)
+    }
+    return $settingsRoot
+}
+
+function Get-ProfileSettingsFolderPath {
+    $profilesRoot = Join-Path (Get-UserSettingsRootPath) 'profiles'
+    if (-not (Test-Path -Path $profilesRoot)) {
+        [void](New-Item -Path $profilesRoot -ItemType Directory -Force)
+    }
+    return $profilesRoot
+}
+
+function Get-SafeProfileName {
+    param([string]$ProfileName)
+
+    if ([string]::IsNullOrWhiteSpace($ProfileName)) {
+        return 'Default'
+    }
+
+    $clean = ($ProfileName -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { return 'Default' }
+    return $clean
+}
+
+function Get-ProfileSettingsFilePath {
+    param([string]$ProfileName = 'Default')
+    $safeName = Get-SafeProfileName -ProfileName $ProfileName
+    return (Join-Path (Get-ProfileSettingsFolderPath) "$safeName.json")
+}
+
+function Get-ActiveProfileFilePath {
+    return (Join-Path (Get-UserSettingsRootPath) 'active-profile.txt')
+}
+
+function Get-ActiveProfileName {
+    $path = Get-ActiveProfileFilePath
+    if (-not (Test-Path -Path $path)) { return 'Default' }
+    try {
+        $name = (Get-Content -Path $path -Raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) { return 'Default' }
+        return (Get-SafeProfileName -ProfileName $name)
+    }
+    catch {
+        return 'Default'
+    }
+}
+
+function Set-ActiveProfileName {
+    param([string]$ProfileName)
+    $safeName = Get-SafeProfileName -ProfileName $ProfileName
+    $safeName | Set-Content -Path (Get-ActiveProfileFilePath) -Encoding UTF8
+}
+
+function Get-ProfileNames {
+    $profilesRoot = Get-ProfileSettingsFolderPath
+    $files = @(Get-ChildItem -Path $profilesRoot -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $names = @('Default')
+    foreach ($file in $files) {
+        if ($file.BaseName -ne 'Default') {
+            $names += $file.BaseName
+        }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+function Get-UserSettings {
+    param([string]$ProfileName = 'Default')
+    $path = Get-ProfileSettingsFilePath -ProfileName $ProfileName
+    if (-not (Test-Path -Path $path)) { return $null }
+
+    try {
+        return (Get-Content -Path $path -Raw | ConvertFrom-Json)
+    }
+    catch {
+        Write-Log "Unable to load user settings file at $path. Using defaults." -Level Warn
+        return $null
+    }
+}
+
+function Save-UserSettings {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Forms.TabControl]$TabControl,
+        [string]$ProfileName = 'Default'
+    )
+
+    $path = Get-ProfileSettingsFilePath -ProfileName $ProfileName
+    $payload = [pscustomobject]@{
+        HeaderColor = @{
+            R = $script:HeaderColor.R
+            G = $script:HeaderColor.G
+            B = $script:HeaderColor.B
+        }
+        AccentColor = @{
+            R = $script:AccentColor.R
+            G = $script:AccentColor.G
+            B = $script:AccentColor.B
+        }
+        DarkMode = [bool]$script:IsDarkMode
+        TabOrder = @($TabControl.TabPages | ForEach-Object { $_.Text })
+        CookieClicker = (Get-CookieClickerSaveState)
+    }
+
+    $payload | ConvertTo-Json -Depth 4 | Set-Content -Path $path -Encoding UTF8
+    Set-ActiveProfileName -ProfileName $ProfileName
+}
+
+function Test-HostPing {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName
+    )
+
+    try {
+        return Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-RemoteAccess {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    try {
+        Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch {
+        Show-Error "Unable to connect to $ComputerName through PowerShell remoting.`r`n$($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Format-Uptime {
+    param([datetime]$LastBoot)
+
+    if (-not $LastBoot) { return '' }
+    $span = (Get-Date) - $LastBoot
+    return ('{0}d {1}h {2}m' -f [int]$span.TotalDays, $span.Hours, $span.Minutes)
+}
+
+function Get-RemoteSystemInfo {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        $cs = Get-CimInstance Win32_ComputerSystem
+        $bios = Get-CimInstance Win32_BIOS
+        $os = Get-CimInstance Win32_OperatingSystem
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+        $net = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {
+            $_.IPEnabled -eq $true -and $_.IPAddress
+        } | Select-Object -First 1
+
+        $blState = ''
+        try {
+            $bl = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+            $blState = "$($bl.ProtectionStatus) / $($bl.VolumeStatus)"
+        }
+        catch {
+            $blState = 'Unavailable'
+        }
+
+        [pscustomobject]@{
+            ComputerName = $env:COMPUTERNAME
+            LoggedInUser  = [string]$cs.UserName
+            Model         = [string]$cs.Model
+            SerialNumber  = [string]$bios.SerialNumber
+            OSVersion     = [string]$os.Caption
+            BuildNumber   = [string]$os.BuildNumber
+            LastBoot      = [datetime]$os.LastBootUpTime
+            Uptime        = ((Get-Date) - [datetime]$os.LastBootUpTime).ToString()
+            IPAddress     = [string](($net.IPAddress | Where-Object { $_ -notlike 'fe80*' } | Select-Object -First 1))
+            FreeSpaceGB   = if ($disk.Size) { [math]::Round($disk.FreeSpace / 1GB, 2) } else { '' }
+            TotalSpaceGB  = if ($disk.Size) { [math]::Round($disk.Size / 1GB, 2) } else { '' }
+            BitLocker     = $blState
+        }
+    } -ErrorAction Stop
+}
+
+function Get-RemoteUserProfiles {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    $profiles = Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        Get-CimInstance Win32_UserProfile |
+            Where-Object {
+                $_.LocalPath -like 'C:\Users\*' -and
+                $_.Special -eq $false
+            } |
+            Select-Object @{
+                Name='LocalPath'
+                Expression={ $_.LocalPath }
+            }, @{
+                Name='SID'
+                Expression={ $_.SID }
+            }, @{
+                Name='Loaded'
+                Expression={ $_.Loaded }
+            }, @{
+                Name='LastUseTime'
+                Expression={
+                    try {
+                        if ($_.LastUseTime) {
+                            [string]$_.LastUseTime
+                        }
+                        else {
+                            ''
+                        }
+                    }
+                    catch {
+                        ''
+                    }
+                }
+            }
+    } -ErrorAction Stop
+
+    return $profiles
+}
+
+function Remove-RemoteUserProfile {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [string]$Sid,
+        [Parameter(Mandatory)] [string]$LocalPath
+    )
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -ArgumentList $Sid, $LocalPath -ScriptBlock {
+        param($Sid, $LocalPath)
+
+        $profile = Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $Sid }
+        if (-not $profile) {
+            throw "Profile with SID $Sid was not found."
+        }
+
+        if ($profile.Loaded) {
+            throw "Profile is currently loaded and cannot be deleted safely: $LocalPath"
+        }
+
+        Remove-CimInstance -InputObject $profile -ErrorAction Stop
+
+        if (Test-Path $LocalPath) {
+            Remove-Item -Path $LocalPath -Recurse -Force -ErrorAction Stop
+        }
+
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid"
+        if (Test-Path $regPath) {
+            Remove-Item -Path $regPath -Recurse -Force -ErrorAction Stop
+        }
+
+        [pscustomobject]@{
+            SID     = $Sid
+            Path    = $LocalPath
+            Removed = $true
+        }
+    } -ErrorAction Stop
+}
+
+function Get-BitLockerKeyFromArchive {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName
+    )
+
+    $archiveFile = "PLACEHOLDER"
+
+    if (-not (Test-Path $archiveFile)) {
+        throw "Archived BitLocker file not found: $archiveFile"
+    }
+
+    $content = Get-Content -Path $archiveFile -ErrorAction Stop
+    $recoveryKey = $null
+
+    foreach ($line in $content) {
+        if ($line -match '(?<!\d)(\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6}-\d{6})(?!\d)') {
+            $recoveryKey = $matches[1]
+            break
+        }
+    }
+
+    if (-not $recoveryKey) {
+        $recoveryLine = $content | Where-Object { $_ -match 'Recovery|Password|Key' } | Select-Object -First 1
+        if ($recoveryLine) {
+            $recoveryKey = $recoveryLine.Trim()
+        }
+    }
+
+    return [pscustomobject]@{
+        FilePath    = $archiveFile
+        RecoveryKey = $recoveryKey
+        FileContent = ($content -join [Environment]::NewLine)
+    }
+}
+
+function Enable-RemoteBitLocker {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    $driverScript = "PLACEHOLDER"
+    $shareSource  = "PLACEHOLDER"
+    $destFolder   = "PLACEHOLDER"
+    $destFile     = Join-Path $destFolder "${ComputerName}_BLout.txt"
+
+    if (-not (Test-Path $driverScript)) {
+        throw "BitLocker driver script not found: $driverScript"
+    }
+
+    if (-not (Test-Path $destFolder)) {
+        throw "Destination folder not reachable: $destFolder"
+    }
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -FilePath $driverScript -ErrorAction Stop
+
+    $maxAttempts = 12
+    $attempt = 0
+    do {
+        Start-Sleep -Seconds 5
+        $attempt++
+    } until ((Test-Path $shareSource) -or ($attempt -ge $maxAttempts))
+
+    if (-not (Test-Path $shareSource)) {
+        throw "Expected output file was not found on remote host: $shareSource"
+    }
+
+    Move-Item -Path $shareSource -Destination $destFile -Force -ErrorAction Stop
+
+    if (-not (Test-Path $destFile)) {
+        throw "Unable to confirm moved BitLocker file at: $destFile"
+    }
+
+    return Get-BitLockerKeyFromArchive -ComputerName $ComputerName
+}
+
+function Restart-RemoteComputerSafe {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        Restart-Computer -Force
+    } -ErrorAction Stop
+}
+
+function Shutdown-RemoteComputerSafe {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+        Stop-Computer -Force
+    } -ErrorAction Stop
+}
+
+function Invoke-GeneralRemoteCommand {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [ValidateSet('GPUpdate','IPConfig','FlushDNS','ReleaseRenew')] [string]$Action
+    )
+
+    switch ($Action) {
+        'GPUpdate' {
+            return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+                gpupdate /force | Out-String
+            } -ErrorAction Stop
+        }
+        'IPConfig' {
+            return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+                ipconfig /all | Out-String
+            } -ErrorAction Stop
+        }
+        'FlushDNS' {
+            return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+                ipconfig /flushdns | Out-String
+            } -ErrorAction Stop
+        }
+        'ReleaseRenew' {
+            return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+                $release = ipconfig /release | Out-String
+                Start-Sleep -Seconds 4
+                $renew = ipconfig /renew | Out-String
+                "$release`r`n$renew"
+            } -ErrorAction Stop
+        }
+    }
+}
+
+function Invoke-RemoteWindowsUpdate {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [ValidateSet('Check','Install')] [string]$Mode
+    )
+
+    return Invoke-Command -ComputerName $ComputerName -Credential $Credential -ArgumentList $Mode -ScriptBlock {
+        param([string]$Mode)
+
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searchResult = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+        $pending = $searchResult.Updates
+        $pendingCount = [int]$pending.Count
+
+        $titles = @()
+        for ($i = 0; $i -lt $pendingCount; $i++) {
+            $titles += [string]$pending.Item($i).Title
+        }
+
+        if ($Mode -eq 'Check') {
+            return [pscustomobject]@{
+                Mode           = 'Check'
+                PendingCount   = $pendingCount
+                UpdateTitles   = $titles
+                InstalledCount = 0
+                RebootRequired = $false
+                ResultCode     = 'NotRun'
+            }
+        }
+
+        if ($pendingCount -eq 0) {
+            return [pscustomobject]@{
+                Mode           = 'Install'
+                PendingCount   = 0
+                UpdateTitles   = @()
+                InstalledCount = 0
+                RebootRequired = $false
+                ResultCode     = 'NoUpdates'
+            }
+        }
+
+        $collection = New-Object -ComObject Microsoft.Update.UpdateColl
+        for ($i = 0; $i -lt $pendingCount; $i++) {
+            [void]$collection.Add($pending.Item($i))
+        }
+
+        $downloader = $session.CreateUpdateDownloader()
+        $downloader.Updates = $collection
+        [void]$downloader.Download()
+
+        $installer = $session.CreateUpdateInstaller()
+        $installer.Updates = $collection
+        $installResult = $installer.Install()
+
+        $installedCount = 0
+        for ($i = 0; $i -lt $pendingCount; $i++) {
+            if ($installResult.GetUpdateResult($i).ResultCode -eq 2) {
+                $installedCount++
+            }
+        }
+
+        return [pscustomobject]@{
+            Mode           = 'Install'
+            PendingCount   = $pendingCount
+            UpdateTitles   = $titles
+            InstalledCount = $installedCount
+            RebootRequired = [bool]$installResult.RebootRequired
+            ResultCode     = [string]$installResult.ResultCode
+        }
+    } -ErrorAction Stop
+}
+
+function Get-WindowsUpdateResultCodeMeaning {
+    param($ResultCode)
+
+    $codeText = [string]$ResultCode
+    $codeNumber = $null
+    [void][int]::TryParse($codeText, [ref]$codeNumber)
+
+    if ($null -eq $codeNumber) {
+        return 'Unknown/Not numeric'
+    }
+
+    switch ($codeNumber) {
+        0 { return 'Not Started' }
+        1 { return 'In Progress' }
+        2 { return 'Succeeded' }
+        3 { return 'Succeeded With Errors' }
+        4 { return 'Failed' }
+        5 { return 'Aborted' }
+        default { return 'Unknown' }
+    }
+}
+
+function Invoke-RemotePopup {
+    param(
+        [Parameter(Mandatory)] [string]$ComputerName,
+        [Parameter(Mandatory)] [pscredential]$Credential,
+        [Parameter(Mandatory)] [string]$Message
+    )
+    try {
+        $result = Invoke-Command -ComputerName $ComputerName -Credential $Credential -ScriptBlock {
+            $msgPath = Join-Path $env:SystemRoot 'System32\msg.exe'
+            if (-not (Test-Path -Path $msgPath)) {
+                throw 'msg.exe was not found on the target machine.'
+            }
+
+            # Send to all active sessions on the local target machine.
+            $cmdOutput = & $msgPath * /time:120 $using:Message 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+
+            [pscustomobject]@{
+                ExitCode = $exitCode
+                Output   = $cmdOutput
+            }
+        } -ErrorAction Stop
+
+        if ($result.ExitCode -eq 0) {
+            return $true
+        }
+
+        $detail = if ([string]::IsNullOrWhiteSpace([string]$result.Output)) { 'No additional details returned.' } else { [string]$result.Output }
+        Write-Log "Popup command failed on $ComputerName with exit code $($result.ExitCode). Details: $detail" -Level Error
+        return $false
+    }
+    catch {
+        Write-Log "Error sending popup to ${ComputerName}: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+function Get-ComputerTargetsFromInput {
+    param(
+        [string]$RawComputerInput,
+        [string]$FilePathInput
+    )
+
+    $targets = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($RawComputerInput)) {
+        $normalized = $RawComputerInput -replace '[,;]+', [Environment]::NewLine
+        $targets += ($normalized -split '[\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($FilePathInput)) {
+        if (-not (Test-Path -Path $FilePathInput)) {
+            throw "The file path does not exist: $FilePathInput"
+        }
+
+        $fileTargets = Get-Content -Path $FilePathInput -ErrorAction Stop |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and -not $_.StartsWith('#') }
+
+        $targets += $fileTargets
+    }
+
+    return @($targets | Sort-Object -Unique)
+}
+
+function Ensure-ActiveDirectoryModule {
+    if (Get-Module -Name ActiveDirectory) {
+        return
+    }
+
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+    }
+    catch {
+        throw "ActiveDirectory module is required but could not be loaded. $($_.Exception.Message)"
+    }
+}
+
+function Get-NextUnixUidNumber {
+    param(
+        [Parameter(Mandatory)] [string]$DomainDn,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    $existing = Get-ADObject -SearchBase $DomainDn -LDAPFilter '(uidNumber=*)' -Properties uidNumber -Credential $Credential -ErrorAction Stop |
+        ForEach-Object { [int]$_.uidNumber } |
+        Sort-Object -Descending
+
+    if ($existing.Count -gt 0) {
+        return ([int]$existing[0] + 1)
+    }
+
+    return 11001
+}
+
+function New-ADPl2User {
+    param(
+        [Parameter(Mandatory)] [string]$FirstName,
+        [Parameter(Mandatory)] [string]$LastName,
+        [Parameter(Mandatory)] [string]$OuCode,
+        [Parameter(Mandatory)] [string]$Password,
+        [Parameter(Mandatory)] [string]$DomainDn,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Ensure-ActiveDirectoryModule
+
+    $first = $FirstName.Trim()
+    $last = $LastName.Trim()
+    $ou = $OuCode.Trim().ToLower()
+
+    if ($first.Length -lt 1 -or $last.Length -lt 1 -or $ou.Length -lt 1) {
+        throw 'First name, last name, and OU are required.'
+    }
+
+    $firstInitialLower = $first.Substring(0, 1).ToLower()
+    $firstInitialUpper = $first.Substring(0, 1)
+    if ($ou -eq 'PLACEHOLDER') {
+        $username = ("{0}{1}" -f $last, $firstInitialLower).ToLower()
+        $displayName = "$first $last"
+    }
+    else {
+        $username = ("{0}{1}_{2}" -f $last, $firstInitialUpper, $ou).ToLower()
+        $displayName = "$first $last ($ou)"
+    }
+
+    $email = "PLACEHOLDER"
+    $secGroupPath = "OU=$ou,OU=SecurityGroups,OU=Groups,OU=PL2,$DomainDn"
+    $securePassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
+
+    $existingUser = Get-ADUser -Filter "SamAccountName -eq '$username'" -Credential $Credential -ErrorAction SilentlyContinue
+    if ($existingUser) {
+        throw "User '$username' already exists in Active Directory."
+    }
+
+    $nextId = Get-NextUnixUidNumber -DomainDn $DomainDn -Credential $Credential
+    $homeDir = "/home/$username"
+
+    New-ADUser -Name $username `
+        -SamAccountName $username `
+        -UserPrincipalName $email `
+        -Path $secGroupPath `
+        -GivenName $first `
+        -Surname $last `
+        -DisplayName $displayName `
+        -AccountPassword $securePassword `
+        -PasswordNeverExpires $false `
+        -Enabled $true `
+        -ChangePasswordAtLogon $true `
+        -Credential $Credential `
+        -ErrorAction Stop
+
+    Set-ADUser -Identity $username -Replace @{
+        msSFU30Name         = $username
+        msSFU30NisDomain    = 'PLACEHOLDER'
+        loginShell          = '/bin/bash'
+        uidNumber           = [string]$nextId
+        uid                 = $username
+        gidNumber           = '11000'
+        unixHomeDirectory   = $homeDir
+        primaryGroupID      = '513'
+        unixUserPassword    = 'ABCD!efg12345$67890'
+        telephoneNumber     = [string]$nextId
+        mail                = $email
+    } -Credential $Credential -ErrorAction Stop
+
+    Add-ADGroupMember -Identity 'RDesktop Users' -Members $username -Credential $Credential -ErrorAction Stop
+    $ouNonAdminGroup = "$ou-nonadmins"
+    Add-ADGroupMember -Identity $ouNonAdminGroup -Members $username -Credential $Credential -ErrorAction Stop
+
+    $newUser = Get-ADUser -Identity $username -Properties DistinguishedName -Credential $Credential -ErrorAction Stop
+    Rename-ADObject -Identity $newUser.DistinguishedName -NewName $displayName -Credential $Credential -ErrorAction Stop
+
+    return [pscustomobject]@{
+        UserName    = $username
+        DisplayName = $displayName
+        Email       = $email
+        UidNumber   = $nextId
+    }
+}
+
+function Remove-ADPl2User {
+    param(
+        [Parameter(Mandatory)] [string]$UserName,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Ensure-ActiveDirectoryModule
+
+    $targetUser = Get-ADUser -Identity $UserName -Properties DisplayName -Credential $Credential -ErrorAction Stop
+    Remove-ADUser -Identity $targetUser.DistinguishedName -Credential $Credential -Confirm:$false -ErrorAction Stop
+
+    return [pscustomobject]@{
+        UserName    = [string]$targetUser.SamAccountName
+        DisplayName = [string]$targetUser.DisplayName
+    }
+}
+
+function Search-ADPl2Users {
+    param(
+        [Parameter(Mandatory)] [string]$SearchTerm,
+        [Parameter(Mandatory)] [pscredential]$Credential
+    )
+
+    Ensure-ActiveDirectoryModule
+
+    $term = $SearchTerm.Trim()
+    if ([string]::IsNullOrWhiteSpace($term)) {
+        return @()
+    }
+
+    $safeTerm = $term.Replace("'", "''")
+    $filter = "SamAccountName -like '*$safeTerm*' -or Name -like '*$safeTerm*' -or DisplayName -like '*$safeTerm*' -or GivenName -like '*$safeTerm*' -or Surname -like '*$safeTerm*' -or mail -like '*$safeTerm*'"
+
+    $results = Get-ADUser -Filter $filter -Properties DisplayName, mail -Credential $Credential -ErrorAction Stop |
+        Sort-Object SamAccountName |
+        Select-Object -First 200
+
+    return @($results)
+}
+
+function Format-CookieNumber {
+    param([double]$Value)
+
+    if ($Value -ge 1000000000000) { return ('{0:N2}T' -f ($Value / 1000000000000.0)) }
+    if ($Value -ge 1000000000) { return ('{0:N2}B' -f ($Value / 1000000000.0)) }
+    if ($Value -ge 1000000) { return ('{0:N2}M' -f ($Value / 1000000.0)) }
+    if ($Value -ge 1000) { return ('{0:N2}K' -f ($Value / 1000.0)) }
+    if ($Value -ge 100) { return ('{0:N0}' -f $Value) }
+    return ('{0:N1}' -f $Value)
+}
+
+function Initialize-CookieUpgrades {
+    $script:CookieUpgrades = [ordered]@{
+        Click = [pscustomobject]@{ Key='Click'; Name='Click Training'; Type='Click'; BaseCost=25.0; CostMultiplier=1.25; Gain=1.0; OutputMultiplier=1.08; UnlockPrestige=0; Level=0 }
+        Gloves = [pscustomobject]@{ Key='Gloves'; Name='Titanium Gloves'; Type='Click'; BaseCost=250.0; CostMultiplier=1.30; Gain=4.0; OutputMultiplier=1.10; UnlockPrestige=0; Level=0 }
+        ExoFinger = [pscustomobject]@{ Key='ExoFinger'; Name='Exo Finger Rig'; Type='Click'; BaseCost=8500.0; CostMultiplier=1.33; Gain=28.0; OutputMultiplier=1.12; UnlockPrestige=0; Level=0 }
+        HyperTap = [pscustomobject]@{ Key='HyperTap'; Name='Hyper Tap Matrix'; Type='Click'; BaseCost=190000.0; CostMultiplier=1.36; Gain=190.0; OutputMultiplier=1.14; UnlockPrestige=0; Level=0 }
+        ArcPulse = [pscustomobject]@{ Key='ArcPulse'; Name='Arc Pulse Gauntlet'; Type='Click'; BaseCost=7200000.0; CostMultiplier=1.34; Gain=4800.0; OutputMultiplier=1.16; UnlockPrestige=5; Level=0 }
+        MythicGlove = [pscustomobject]@{ Key='MythicGlove'; Name='Mythic Glove Array'; Type='Click'; BaseCost=2500000.0; CostMultiplier=1.33; Gain=2200.0; OutputMultiplier=1.17; UnlockPrestige=10; Level=0 }
+        Cursor = [pscustomobject]@{ Key='Cursor'; Name='Auto Cursor'; Type='Passive'; BaseCost=50.0; CostMultiplier=1.16; Gain=1.2; OutputMultiplier=1.08; UnlockPrestige=0; Level=0 }
+        Grandma = [pscustomobject]@{ Key='Grandma'; Name='Cookie Grandma'; Type='Passive'; BaseCost=220.0; CostMultiplier=1.18; Gain=5.5; OutputMultiplier=1.09; UnlockPrestige=0; Level=0 }
+        Farm = [pscustomobject]@{ Key='Farm'; Name='Cookie Farm'; Type='Passive'; BaseCost=1300.0; CostMultiplier=1.20; Gain=24.0; OutputMultiplier=1.10; UnlockPrestige=0; Level=0 }
+        Mine = [pscustomobject]@{ Key='Mine'; Name='Chocolate Mine'; Type='Passive'; BaseCost=7600.0; CostMultiplier=1.22; Gain=105.0; OutputMultiplier=1.11; UnlockPrestige=0; Level=0 }
+        Factory = [pscustomobject]@{ Key='Factory'; Name='Cookie Factory'; Type='Passive'; BaseCost=42000.0; CostMultiplier=1.24; Gain=360.0; OutputMultiplier=1.12; UnlockPrestige=0; Level=0 }
+        Bank = [pscustomobject]@{ Key='Bank'; Name='Cookie Bank'; Type='Passive'; BaseCost=230000.0; CostMultiplier=1.26; Gain=1250.0; OutputMultiplier=1.13; UnlockPrestige=0; Level=0 }
+        Lab = [pscustomobject]@{ Key='Lab'; Name='Quantum Oven Lab'; Type='Passive'; BaseCost=1400000.0; CostMultiplier=1.28; Gain=4300.0; OutputMultiplier=1.14; UnlockPrestige=3; Level=0 }
+        Portal = [pscustomobject]@{ Key='Portal'; Name='Cookie Portal'; Type='Passive'; BaseCost=9000000.0; CostMultiplier=1.29; Gain=16500.0; OutputMultiplier=1.16; UnlockPrestige=5; Level=0 }
+        PrismReactor = [pscustomobject]@{ Key='PrismReactor'; Name='Prism Reactor'; Type='Passive'; BaseCost=32000000.0; CostMultiplier=1.31; Gain=98000.0; OutputMultiplier=1.17; UnlockPrestige=10; Level=0 }
+        CelestialPrinter = [pscustomobject]@{ Key='CelestialPrinter'; Name='Celestial Printer'; Type='Passive'; BaseCost=52000000.0; CostMultiplier=1.30; Gain=52000.0; OutputMultiplier=1.18; UnlockPrestige=10; Level=0 }
+        SingularityForge = [pscustomobject]@{ Key='SingularityForge'; Name='Singularity Forge'; Type='Passive'; BaseCost=410000000.0; CostMultiplier=1.32; Gain=380000.0; OutputMultiplier=1.20; UnlockPrestige=15; Level=0 }
+        ChronoVault = [pscustomobject]@{ Key='ChronoVault'; Name='Chrono Vault'; Type='Passive'; BaseCost=650000000.0; CostMultiplier=1.33; Gain=620000.0; OutputMultiplier=1.21; UnlockPrestige=15; Level=0 }
+    }
+}
+
+function Get-CookieMilestoneThresholds {
+    return @(3, 5, 10, 15)
+}
+
+function Get-CookieUnlockedUpgradeKeys {
+    $keys = @()
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        $required = if ($upgrade.PSObject.Properties.Name -contains 'UnlockPrestige') { [int]$upgrade.UnlockPrestige } else { 0 }
+        if ($script:CookiePrestigeCount -ge $required) {
+            $keys += $upgrade.Key
+        }
+    }
+    return @($keys)
+}
+
+function Show-CookieEventBanner {
+    param(
+        [string]$Message,
+        [System.Drawing.Color]$BackColor
+    )
+    if (-not $script:lblCookieEvent) { return }
+    $script:lblCookieEvent.Text = $Message
+    $script:lblCookieEvent.BackColor = $BackColor
+    $script:lblCookieEvent.Visible = $true
+    $script:cookieEventHideAt = (Get-Date).AddSeconds(3)
+}
+
+function Get-CookiePrestigeCost {
+    $baseCost = 1000000.0
+    return [Math]::Round($baseCost * [Math]::Pow(1.85, [double]$script:CookiePrestigeCount), 2)
+}
+
+function Get-CookieUpgradeCost {
+    param([Parameter(Mandatory)] [string]$UpgradeKey)
+    $upgrade = $script:CookieUpgrades[$UpgradeKey]
+    if (-not $upgrade) { return 0.0 }
+    $baseCost = [double]$upgrade.BaseCost * [Math]::Pow($upgrade.CostMultiplier, $upgrade.Level)
+    $discountPerk = [int]$script:CookiePrestigePerkStacks['FrugalEngineering']
+    $discountFactor = [Math]::Pow(0.92, $discountPerk)
+    $economyDiscount = [Math]::Pow(0.95, [int]$script:CookieAscensionTree['Economy'])
+    $discountFactor *= $economyDiscount
+    if ($discountFactor -lt 0.30) { $discountFactor = 0.30 }
+    return [Math]::Round(($baseCost * $discountFactor), 2)
+}
+
+function Recalculate-CookieRates {
+    $script:CookiesPerClick = 1.0
+    $script:CookiesPerSecond = 0.0
+    $script:CookieCritChance = [Math]::Min(0.60, 0.03 * [int]$script:CookieAscensionTree['Luck'])
+    $script:CookieCritMultiplier = 2.0 + (0.40 * [int]$script:CookieAscensionTree['Luck'])
+
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        if ($upgrade.Level -le 0) { continue }
+        $level = [int]$upgrade.Level
+        $outputMultiplier = if ($upgrade.PSObject.Properties.Name -contains 'OutputMultiplier') { [double]$upgrade.OutputMultiplier } else { 1.0 }
+        $totalOutput = 0.0
+
+        if ($outputMultiplier -eq 1.0) {
+            $totalOutput = [double]$upgrade.Gain * $level
+        }
+        else {
+            $totalOutput = [double]$upgrade.Gain * (([Math]::Pow($outputMultiplier, $level) - 1.0) / ($outputMultiplier - 1.0))
+        }
+
+        if ($upgrade.Type -eq 'Click') {
+            $script:CookiesPerClick += $totalOutput
+        }
+        else {
+            $script:CookiesPerSecond += $totalOutput
+        }
+    }
+
+    $clickPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['ClickMastery'])
+    $autoPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['AutomationSurge'])
+    $clickAscensionBoost = [Math]::Pow(1.07, [int]$script:CookieAscensionTree['Click'])
+    $autoAscensionBoost = [Math]::Pow(1.13, [int]$script:CookieAscensionTree['Automation'])
+    $luckCpsBoost = [Math]::Pow(1.03, [int]$script:CookieAscensionTree['Luck'])
+    $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * $clickPerkBoost), 4)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $autoPerkBoost), 4)
+    $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * $clickAscensionBoost), 4)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $autoAscensionBoost), 4)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $luckCpsBoost), 4)
+}
+
+function Get-CookieUpgradeNextGain {
+    param([Parameter(Mandatory)] [string]$UpgradeKey)
+    $upgrade = $script:CookieUpgrades[$UpgradeKey]
+    if (-not $upgrade) { return 0.0 }
+
+    $level = [int]$upgrade.Level
+    $outputMultiplier = if ($upgrade.PSObject.Properties.Name -contains 'OutputMultiplier') { [double]$upgrade.OutputMultiplier } else { 1.0 }
+    return [double]$upgrade.Gain * [Math]::Pow($outputMultiplier, $level)
+}
+
+function Get-CookieClickerSaveState {
+    if (-not $script:CookieUpgrades) { Initialize-CookieUpgrades }
+    return [pscustomobject]@{
+        CookieCount = [double]$script:CookieCount
+        PrestigeCount = [int]$script:CookiePrestigeCount
+        PrestigePerks = [pscustomobject]@{
+            ClickMastery = [int]$script:CookiePrestigePerkStacks['ClickMastery']
+            AutomationSurge = [int]$script:CookiePrestigePerkStacks['AutomationSurge']
+            FrugalEngineering = [int]$script:CookiePrestigePerkStacks['FrugalEngineering']
+        }
+        Ascension = [pscustomobject]@{
+            Points = [int]$script:CookieAscensionPoints
+            Click = [int]$script:CookieAscensionTree['Click']
+            Automation = [int]$script:CookieAscensionTree['Automation']
+            Economy = [int]$script:CookieAscensionTree['Economy']
+            Luck = [int]$script:CookieAscensionTree['Luck']
+        }
+        Upgrades = @($script:CookieUpgrades.Values | ForEach-Object {
+            [pscustomobject]@{
+                Key = $_.Key
+                Level = [int]$_.Level
+            }
+        })
+    }
+}
+
+function Import-CookieClickerSaveState {
+    param($SavedState)
+
+    if (-not $script:CookieUpgrades) { Initialize-CookieUpgrades }
+    $script:CookiePrestigeCount = 0
+    $script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
+    $script:CookieAscensionPoints = 0
+    $script:CookieAscensionTree = @{ Click = 0; Automation = 0; Economy = 0; Luck = 0 }
+    $script:CookieSeenMilestones = @{}
+    $script:CookieCount = 0.0
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        $upgrade.Level = 0
+    }
+
+    if ($SavedState) {
+        if ($SavedState.PSObject.Properties.Name -contains 'CookieCount') {
+            $script:CookieCount = [Math]::Max(0.0, [double]$SavedState.CookieCount)
+        }
+
+        if ($SavedState.PSObject.Properties.Name -contains 'PrestigeCount') {
+            $script:CookiePrestigeCount = [Math]::Max(0, [int]$SavedState.PrestigeCount)
+        }
+
+        if ($SavedState.PSObject.Properties.Name -contains 'PrestigePerks' -and $SavedState.PrestigePerks) {
+            foreach ($perkName in @('ClickMastery', 'AutomationSurge', 'FrugalEngineering')) {
+                if ($SavedState.PrestigePerks.PSObject.Properties.Name -contains $perkName) {
+                    $script:CookiePrestigePerkStacks[$perkName] = [Math]::Max(0, [int]$SavedState.PrestigePerks.$perkName)
+                }
+            }
+        }
+        if ($SavedState.PSObject.Properties.Name -contains 'Ascension' -and $SavedState.Ascension) {
+            if ($SavedState.Ascension.PSObject.Properties.Name -contains 'Points') {
+                $script:CookieAscensionPoints = [Math]::Max(0, [int]$SavedState.Ascension.Points)
+            }
+            foreach ($branch in @('Click', 'Automation', 'Economy', 'Luck')) {
+                if ($SavedState.Ascension.PSObject.Properties.Name -contains $branch) {
+                    $script:CookieAscensionTree[$branch] = [Math]::Max(0, [int]$SavedState.Ascension.$branch)
+                }
+            }
+        }
+
+        if ($SavedState.PSObject.Properties.Name -contains 'Upgrades' -and $SavedState.Upgrades) {
+            foreach ($savedUpgrade in $SavedState.Upgrades) {
+                $key = [string]$savedUpgrade.Key
+                if ($script:CookieUpgrades.Contains($key)) {
+                    $script:CookieUpgrades[$key].Level = [Math]::Max(0, [int]$savedUpgrade.Level)
+                }
+            }
+        }
+
+    }
+
+    Recalculate-CookieRates
+    foreach ($threshold in (Get-CookieMilestoneThresholds)) {
+        if ($script:CookiePrestigeCount -ge $threshold) {
+            $script:CookieSeenMilestones["M$threshold"] = $true
+        }
+    }
+    Update-CookieClickerUi
+}
+
+function Update-CookieClickerUi {
+    if (-not $script:lblCookieCount) { return }
+
+    $script:lblCookieCount.Text = "Cookies: $(Format-CookieNumber -Value $script:CookieCount)"
+    $script:lblCookieStats.Text = "CPc: $(Format-CookieNumber -Value $script:CookiesPerClick)   |   CPS: $(Format-CookieNumber -Value $script:CookiesPerSecond)"
+    if ($script:lblPrestigeInfo) {
+        $cost = Get-CookiePrestigeCost
+        $script:lblPrestigeInfo.Text = "Prestiges: $($script:CookiePrestigeCount)  |  Next Cost: $(Format-CookieNumber -Value $cost)"
+    }
+    if ($script:lblPrestigePerks) {
+        $script:lblPrestigePerks.Text = "Perks - Click Mastery: $($script:CookiePrestigePerkStacks['ClickMastery'])  |  Automation Surge: $($script:CookiePrestigePerkStacks['AutomationSurge'])  |  Frugal Engineering: $($script:CookiePrestigePerkStacks['FrugalEngineering'])"
+    }
+    if ($script:lblPrestigeMultipliers) {
+        $clickMult = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['ClickMastery'])
+        $autoMult = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['AutomationSurge'])
+        $costMult = [Math]::Pow(0.92, [int]$script:CookiePrestigePerkStacks['FrugalEngineering'])
+        if ($costMult -lt 0.35) { $costMult = 0.35 }
+        $script:lblPrestigeMultipliers.Text = "xCPc $([Math]::Round($clickMult, 2))  xCPS $([Math]::Round($autoMult, 2))  xCost $([Math]::Round($costMult, 2))"
+    }
+    if ($script:lblAscensionInfo) {
+        $spent = [int]$script:CookieAscensionTree['Click'] + [int]$script:CookieAscensionTree['Automation'] + [int]$script:CookieAscensionTree['Economy'] + [int]$script:CookieAscensionTree['Luck']
+        $available = [Math]::Max(0, [int]$script:CookieAscensionPoints - $spent)
+        $script:lblAscensionInfo.Text = "Ascension Points: $available (Total $($script:CookieAscensionPoints))"
+    }
+    if ($script:lblAscensionHint) {
+        $clickLevel = [int]$script:CookieAscensionTree['Click']
+        $autoLevel = [int]$script:CookieAscensionTree['Automation']
+        $economyLevel = [int]$script:CookieAscensionTree['Economy']
+        $luckLevel = [int]$script:CookieAscensionTree['Luck']
+
+        $clickBoostPct = [Math]::Round((([Math]::Pow(1.07, $clickLevel) - 1.0) * 100.0), 1)
+        $autoBoostPct = [Math]::Round((([Math]::Pow(1.13, $autoLevel) - 1.0) * 100.0), 1)
+        $economyCostPct = [Math]::Round((100.0 - ([Math]::Pow(0.95, $economyLevel) * 100.0)), 1)
+        $luckCritChance = [Math]::Round((3.0 * $luckLevel), 1)
+        $luckCritPower = [Math]::Round((0.40 * $luckLevel), 2)
+        $luckCpsPct = [Math]::Round((([Math]::Pow(1.03, $luckLevel) - 1.0) * 100.0), 1)
+
+        $script:lblAscensionHint.Text = "Ascension Effects: CPc +$clickBoostPct% | CPS +$autoBoostPct% | Costs -$economyCostPct% | Luck: Crit +$luckCritChance%, +$luckCritPower power, CPS +$luckCpsPct%"
+    }
+    if ($script:btnAscClick) { $script:btnAscClick.Text = "Click Path (Level $($script:CookieAscensionTree['Click']))" }
+    if ($script:btnAscAuto) { $script:btnAscAuto.Text = "Automation (Level $($script:CookieAscensionTree['Automation']))" }
+    if ($script:btnAscEconomy) { $script:btnAscEconomy.Text = "Economy (Level $($script:CookieAscensionTree['Economy']))" }
+    if ($script:btnAscLuck) { $script:btnAscLuck.Text = "Luck (Level $($script:CookieAscensionTree['Luck']))" }
+    if ($script:lblCritInfo) {
+        $script:lblCritInfo.Text = "Crits: $([Math]::Round($script:CookieCritChance * 100, 1))% chance, x$([Math]::Round($script:CookieCritMultiplier, 2)) power"
+    }
+    if ($script:lblMilestoneInfo) {
+        $next = (Get-CookieMilestoneThresholds | Where-Object { $_ -gt $script:CookiePrestigeCount } | Select-Object -First 1)
+        if ($next) {
+            $script:lblMilestoneInfo.Text = "Next Unlock Milestone: P$next"
+        }
+        else {
+            $script:lblMilestoneInfo.Text = "All milestone unlocks achieved."
+        }
+    }
+    if ($script:btnPrestige) {
+        $script:btnPrestige.Enabled = ($script:CookieCount -ge (Get-CookiePrestigeCost))
+    }
+
+    $visibleIndex = 0
+    $unlockedUpgradeKeys = Get-CookieUnlockedUpgradeKeys
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        if (-not $script:CookieUpgradeButtons.Contains($upgrade.Key)) { continue }
+        $btn = $script:CookieUpgradeButtons[$upgrade.Key]
+        $btn.Visible = $true
+        $col = $visibleIndex % [int]$script:CookieShopCols
+        $row = [int][Math]::Floor($visibleIndex / [int]$script:CookieShopCols)
+        $btn.Location = New-Object System.Drawing.Point(($col * ($script:CookieShopBtnWidth + $script:CookieShopColGap)), ($row * ($script:CookieShopBtnHeight + $script:CookieShopRowGap)))
+        $visibleIndex++
+
+        $gainUnit = if ($upgrade.Type -eq 'Click') { 'CPc' } else { 'CPS' }
+        $isUnlocked = ($unlockedUpgradeKeys -contains $upgrade.Key)
+        if (-not $isUnlocked) {
+            $requiredPrestige = if ($upgrade.PSObject.Properties.Name -contains 'UnlockPrestige') { [int]$upgrade.UnlockPrestige } else { 0 }
+            $btn.Text = "$($upgrade.Name)  [$gainUnit LOCKED]`r`nUnlocks at Prestige $requiredPrestige"
+            $btn.BackColor = [System.Drawing.Color]::FromArgb(78, 74, 95)
+            $btn.ForeColor = [System.Drawing.Color]::FromArgb(220, 220, 230)
+            continue
+        }
+
+        $cost = Get-CookieUpgradeCost -UpgradeKey $upgrade.Key
+        $nextGain = Get-CookieUpgradeNextGain -UpgradeKey $upgrade.Key
+        $btn.Text = "$($upgrade.Name)  Level $($upgrade.Level)`r`n+$(Format-CookieNumber -Value $nextGain) $gainUnit  |  Cost $(Format-CookieNumber -Value $cost)"
+        $affordable = ($script:CookieCount -ge $cost)
+        $btn.BackColor = if ($affordable) { [System.Drawing.Color]::FromArgb(228, 171, 89) } else { [System.Drawing.Color]::FromArgb(117, 93, 183) }
+        $btn.ForeColor = if ($affordable) { [System.Drawing.Color]::FromArgb(35, 24, 20) } else { [System.Drawing.Color]::FromArgb(244, 240, 255) }
+    }
+}
+
+function Invoke-CookiePurchase {
+    param(
+        [Parameter(Mandatory)] [string]$UpgradeKey
+    )
+
+    if (-not $script:CookieUpgrades.Contains($UpgradeKey)) { return $false }
+    $cost = Get-CookieUpgradeCost -UpgradeKey $UpgradeKey
+    if ($script:CookieCount -lt $cost) { return $false }
+
+    $script:CookieCount -= $cost
+    $script:CookieUpgrades[$UpgradeKey].Level++
+    Recalculate-CookieRates
+    Update-CookieClickerUi
+    return $true
+}
+
+function Get-CookieAscensionAvailablePoints {
+    $spent = [int]$script:CookieAscensionTree['Click'] + [int]$script:CookieAscensionTree['Automation'] + [int]$script:CookieAscensionTree['Economy'] + [int]$script:CookieAscensionTree['Luck']
+    return [Math]::Max(0, [int]$script:CookieAscensionPoints - $spent)
+}
+
+function Get-CookieAscensionBranchDescription {
+    param([Parameter(Mandatory)] [ValidateSet('Click', 'Automation', 'Economy', 'Luck')] [string]$Branch)
+    switch ($Branch) {
+        'Click' { return '+7% total CPc per level' }
+        'Automation' { return '+13% total CPS per level' }
+        'Economy' { return '-5% upgrade costs per level (stacks)' }
+        'Luck' { return '+3% crit chance, +0.40 crit power, and +3% CPS per level' }
+    }
+}
+
+function Invoke-CookieAscensionBuy {
+    param([Parameter(Mandatory)] [ValidateSet('Click', 'Automation', 'Economy', 'Luck')] [string]$Branch)
+    if ((Get-CookieAscensionAvailablePoints) -le 0) {
+        Show-Info 'No ascension points available.'
+        return $false
+    }
+    $script:CookieAscensionTree[$Branch] = [int]$script:CookieAscensionTree[$Branch] + 1
+    Recalculate-CookieRates
+    Update-CookieClickerUi
+    Save-CurrentProfileSettings
+    Write-Log "Ascension node upgraded: $Branch (level $($script:CookieAscensionTree[$Branch]))."
+    return $true
+}
+
+function Invoke-CookieMilestoneCheck {
+    foreach ($threshold in (Get-CookieMilestoneThresholds)) {
+        $token = "M$threshold"
+        if (($script:CookiePrestigeCount -ge $threshold) -and (-not $script:CookieSeenMilestones.ContainsKey($token))) {
+            $script:CookieSeenMilestones[$token] = $true
+            Show-CookieEventBanner -Message "Milestone reached: Prestige $threshold unlocked new content!" -BackColor ([System.Drawing.Color]::FromArgb(83, 159, 110))
+            Write-Log "Milestone unlocked at prestige $threshold." -Level Success
+        }
+    }
+}
+
+function Reset-CookieRunState {
+    $script:CookieCount = 0.0
+    foreach ($upgradeKey in @($script:CookieUpgrades.Keys)) {
+        $script:CookieUpgrades[$upgradeKey].Level = 0
+    }
+    Recalculate-CookieRates
+}
+
+function Reset-CookieAllProgress {
+    $script:CookiePrestigeCount = 0
+    $script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
+    Reset-CookieRunState
+}
+
+function Invoke-CookieSaveNow {
+    try {
+        Save-CurrentProfileSettings
+        Write-Log "Cookie Clicker progress saved for profile '$(Get-SelectedSettingsProfileName)'." -Level Success
+        return $true
+    }
+    catch {
+        Write-Log "Cookie Clicker save failed: $($_.Exception.Message)" -Level Error
+        Show-Error "Save failed.`r`n$($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Show-CookiePrestigePerkPicker {
+    $picker = New-Object System.Windows.Forms.Form
+    $picker.Text = 'Choose Your Prestige Perk'
+    $picker.Size = New-Object System.Drawing.Size(560, 300)
+    $picker.StartPosition = 'CenterParent'
+    $picker.FormBorderStyle = 'FixedDialog'
+    $picker.MaximizeBox = $false
+    $picker.MinimizeBox = $false
+    $picker.BackColor = [System.Drawing.Color]::FromArgb(28, 24, 46)
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = 'Pick 1 of 3 perks (stacks every prestige):'
+    $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
+    $lblTitle.ForeColor = [System.Drawing.Color]::White
+    $lblTitle.AutoSize = $true
+    $lblTitle.Location = New-Object System.Drawing.Point(16, 14)
+    $picker.Controls.Add($lblTitle)
+
+    $choices = @(
+        @{ Key = 'ClickMastery'; Label = 'Click Mastery'; Desc = '+25% total CPc each stack' }
+        @{ Key = 'AutomationSurge'; Label = 'Automation Surge'; Desc = '+25% total CPS each stack' }
+        @{ Key = 'FrugalEngineering'; Label = 'Frugal Engineering'; Desc = '-8% upgrade costs each stack (cap 65% off)' }
+    )
+
+    for ($i = 0; $i -lt $choices.Count; $i++) {
+        $choice = $choices[$i]
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Size = New-Object System.Drawing.Size(165, 140)
+        $btn.Location = New-Object System.Drawing.Point((16 + ($i * 178)), 60)
+        $btn.FlatStyle = 'Flat'
+        $btn.BackColor = [System.Drawing.Color]::FromArgb(93, 76, 152)
+        $btn.ForeColor = [System.Drawing.Color]::White
+        $btn.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+        $btn.Text = "$($choice.Label)`r`n`r`n$($choice.Desc)"
+        $btn.Tag = $choice.Key
+        $btn.Add_Click({
+            $picker.Tag = [string]$this.Tag
+            $picker.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $picker.Close()
+        })
+        $picker.Controls.Add($btn)
+    }
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Size = New-Object System.Drawing.Size(90, 30)
+    $cancel.Location = New-Object System.Drawing.Point(446, 214)
+    $cancel.FlatStyle = 'Flat'
+    $cancel.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 70)
+    $cancel.ForeColor = [System.Drawing.Color]::White
+    $cancel.Add_Click({
+        $picker.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $picker.Close()
+    })
+    $picker.Controls.Add($cancel)
+
+    $result = $picker.ShowDialog()
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+    return [string]$picker.Tag
+}
+
+function Invoke-CookiePrestige {
+    $cost = Get-CookiePrestigeCost
+    if ($script:CookieCount -lt $cost) {
+        Show-Info "Need $(Format-CookieNumber -Value $cost) cookies to prestige."
+        return $false
+    }
+
+    $confirm = Show-YesNo "Prestige now for 1 perk pick?`r`nThis resets cookies and all upgrade levels."
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+        return $false
+    }
+
+    $selectedPerk = Show-CookiePrestigePerkPicker
+    if ([string]::IsNullOrWhiteSpace($selectedPerk)) {
+        Write-Log 'Prestige canceled before perk selection.' -Level Warn
+        return $false
+    }
+
+    try {
+        $beforeCookies = [double]$script:CookieCount
+        $script:CookiePrestigeCount++
+        $script:CookieAscensionPoints++
+        $script:CookiePrestigePerkStacks[$selectedPerk] = [int]$script:CookiePrestigePerkStacks[$selectedPerk] + 1
+        Reset-CookieRunState
+        Invoke-CookieMilestoneCheck
+        Show-CookieEventBanner -Message "Prestige complete! +1 Ascension Point earned." -BackColor ([System.Drawing.Color]::FromArgb(170, 76, 139))
+        Update-CookieClickerUi
+        Save-CurrentProfileSettings
+        Write-Log "Prestige complete. Cost gate met at $(Format-CookieNumber -Value $cost), cookies before reset: $(Format-CookieNumber -Value $beforeCookies). Perk: $selectedPerk. Total prestiges: $($script:CookiePrestigeCount)." -Level Success
+        Show-Info 'Prestige complete. Cookies and upgrade levels were reset, and your perk stack was applied.'
+        return $true
+    }
+    catch {
+        Write-Log "Prestige failed: $($_.Exception.Message)" -Level Error
+        Show-Error "Prestige failed.`r`n$($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Invoke-CookieStartOver {
+    $confirm = Show-YesNo "Completely start over Cookie Clicker?`r`nThis will wipe cookies, upgrades, prestiges, and perk stacks."
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+
+    $confirmAgain = Show-YesNo "Final confirmation: this cannot be undone. Reset everything now?"
+    if ($confirmAgain -ne [System.Windows.Forms.DialogResult]::Yes) { return $false }
+
+    try {
+        Reset-CookieAllProgress
+        $script:CookieSeenMilestones = @{}
+        Update-CookieClickerUi
+        Save-CurrentProfileSettings
+        Write-Log "Cookie Clicker progress fully reset by user request." -Level Warn
+        Show-Info 'Cookie Clicker progress was fully reset.'
+        return $true
+    }
+    catch {
+        Write-Log "Start over failed: $($_.Exception.Message)" -Level Error
+        Show-Error "Start over failed.`r`n$($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Initialize-SecretTab {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Forms.TabControl]$TabControl
+    )
+
+    if (-not $script:CookieUpgrades) {
+        Initialize-CookieUpgrades
+    }
+
+    if ($script:SecretTabCreated -and $script:tabSecret) {
+        if (-not $TabControl.TabPages.Contains($script:tabSecret)) {
+            [void]$TabControl.TabPages.Add($script:tabSecret)
+        }
+        return $script:tabSecret
+    }
+
+    $script:CookieUpgradeButtons = @{}
+    $script:tabSecret = New-Object System.Windows.Forms.TabPage
+    $script:tabSecret.Text = 'Secret'
+    $script:tabSecret.BackColor = [System.Drawing.Color]::FromArgb(24, 19, 45)
+
+    $pnlSecretHeader = New-Object System.Windows.Forms.Panel
+    $pnlSecretHeader.Dock = 'Top'
+    $pnlSecretHeader.Height = 102
+    $pnlSecretHeader.BackColor = [System.Drawing.Color]::FromArgb(68, 46, 126)
+    $script:tabSecret.Controls.Add($pnlSecretHeader)
+
+    $lblSecretTitle = New-Object System.Windows.Forms.Label
+    $lblSecretTitle.Text = "Joe's Cookie Clicker"
+    $lblSecretTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 24)
+    $lblSecretTitle.ForeColor = [System.Drawing.Color]::FromArgb(255, 235, 161)
+    $lblSecretTitle.AutoSize = $true
+    $lblSecretTitle.Location = New-Object System.Drawing.Point(18, 8)
+    $pnlSecretHeader.Controls.Add($lblSecretTitle)
+
+    $lblSecretSub = New-Object System.Windows.Forms.Label
+    $lblSecretSub.Text = 'Long run economy: click scaling, passive tiers, and rising costs.'
+    $lblSecretSub.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $lblSecretSub.ForeColor = [System.Drawing.Color]::White
+    $lblSecretSub.AutoSize = $true
+    $lblSecretSub.Location = New-Object System.Drawing.Point(22, 62)
+    $pnlSecretHeader.Controls.Add($lblSecretSub)
+
+    $script:lblCookieCount = New-Object System.Windows.Forms.Label
+    $script:lblCookieCount.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20)
+    $script:lblCookieCount.ForeColor = [System.Drawing.Color]::FromArgb(255, 255, 220)
+    $script:lblCookieCount.AutoSize = $true
+    $script:lblCookieCount.Location = New-Object System.Drawing.Point(24, 146)
+    $script:tabSecret.Controls.Add($script:lblCookieCount)
+
+    $script:lblCookieStats = New-Object System.Windows.Forms.Label
+    $script:lblCookieStats.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+    $script:lblCookieStats.ForeColor = [System.Drawing.Color]::FromArgb(225, 226, 255)
+    $script:lblCookieStats.AutoSize = $true
+    $script:lblCookieStats.Location = New-Object System.Drawing.Point(28, 186)
+    $script:tabSecret.Controls.Add($script:lblCookieStats)
+
+    $script:btnCookieClick = New-Object System.Windows.Forms.Button
+    $script:btnCookieClick.Text = 'COOKIE'
+    $script:btnCookieClick.Font = New-Object System.Drawing.Font('Segoe UI Black', 22)
+    $script:btnCookieClick.Size = New-Object System.Drawing.Size(248, 248)
+    $script:btnCookieClick.Location = New-Object System.Drawing.Point(28, 224)
+    $script:btnCookieClick.FlatStyle = 'Flat'
+    $script:btnCookieClick.BackColor = [System.Drawing.Color]::FromArgb(214, 136, 63)
+    $script:btnCookieClick.ForeColor = [System.Drawing.Color]::White
+    $script:tabSecret.Controls.Add($script:btnCookieClick)
+
+    $script:lblCookieEvent = New-Object System.Windows.Forms.Label
+    $script:lblCookieEvent.Text = ''
+    $script:lblCookieEvent.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+    $script:lblCookieEvent.ForeColor = [System.Drawing.Color]::White
+    $script:lblCookieEvent.Location = New-Object System.Drawing.Point(290, 118)
+    $script:lblCookieEvent.Size = New-Object System.Drawing.Size(720, 24)
+    $script:lblCookieEvent.Visible = $false
+    $script:tabSecret.Controls.Add($script:lblCookieEvent)
+
+    $prestigePanel = New-Object System.Windows.Forms.Panel
+    $prestigePanel.Location = New-Object System.Drawing.Point(24, 486)
+    $prestigePanel.Size = New-Object System.Drawing.Size(248, 138)
+    $prestigePanel.BackColor = [System.Drawing.Color]::FromArgb(38, 31, 67)
+    $prestigePanel.BorderStyle = 'FixedSingle'
+    $script:tabSecret.Controls.Add($prestigePanel)
+
+    $script:lblPrestigeInfo = New-Object System.Windows.Forms.Label
+    $script:lblPrestigeInfo.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+    $script:lblPrestigeInfo.ForeColor = [System.Drawing.Color]::FromArgb(245, 238, 255)
+    $script:lblPrestigeInfo.AutoSize = $true
+    $script:lblPrestigeInfo.Location = New-Object System.Drawing.Point(8, 8)
+    $prestigePanel.Controls.Add($script:lblPrestigeInfo)
+
+    $script:btnPrestige = New-Object System.Windows.Forms.Button
+    $script:btnPrestige.Text = 'Prestige (Choose 1 Perk)'
+    $script:btnPrestige.Size = New-Object System.Drawing.Size(228, 28)
+    $script:btnPrestige.Location = New-Object System.Drawing.Point(8, 30)
+    $script:btnPrestige.FlatStyle = 'Flat'
+    $script:btnPrestige.BackColor = [System.Drawing.Color]::FromArgb(209, 92, 145)
+    $script:btnPrestige.ForeColor = [System.Drawing.Color]::White
+    $prestigePanel.Controls.Add($script:btnPrestige)
+
+    $script:btnCookieSaveNow = New-Object System.Windows.Forms.Button
+    $script:btnCookieSaveNow.Text = 'Save Now'
+    $script:btnCookieSaveNow.Size = New-Object System.Drawing.Size(228, 28)
+    $script:btnCookieSaveNow.Location = New-Object System.Drawing.Point(8, 64)
+    $script:btnCookieSaveNow.FlatStyle = 'Flat'
+    $script:btnCookieSaveNow.BackColor = [System.Drawing.Color]::FromArgb(83, 129, 204)
+    $script:btnCookieSaveNow.ForeColor = [System.Drawing.Color]::White
+    $prestigePanel.Controls.Add($script:btnCookieSaveNow)
+
+    $script:btnCookieStartOver = New-Object System.Windows.Forms.Button
+    $script:btnCookieStartOver.Text = 'Start Over'
+    $script:btnCookieStartOver.Size = New-Object System.Drawing.Size(228, 28)
+    $script:btnCookieStartOver.Location = New-Object System.Drawing.Point(8, 98)
+    $script:btnCookieStartOver.FlatStyle = 'Flat'
+    $script:btnCookieStartOver.BackColor = [System.Drawing.Color]::FromArgb(175, 78, 78)
+    $script:btnCookieStartOver.ForeColor = [System.Drawing.Color]::White
+    $prestigePanel.Controls.Add($script:btnCookieStartOver)
+
+    $shopPanel = New-Object System.Windows.Forms.Panel
+    $shopPanel.Location = New-Object System.Drawing.Point(290, 116)
+    $shopPanel.Size = New-Object System.Drawing.Size(720, 424)
+    $shopPanel.BackColor = [System.Drawing.Color]::FromArgb(26, 26, 30)
+    $shopPanel.BorderStyle = 'FixedSingle'
+    $script:tabSecret.Controls.Add($shopPanel)
+
+    $lblShopTitle = New-Object System.Windows.Forms.Label
+    $lblShopTitle.Text = 'Upgrade Shop'
+    $lblShopTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
+    $lblShopTitle.ForeColor = [System.Drawing.Color]::FromArgb(246, 239, 255)
+    $lblShopTitle.AutoSize = $true
+    $lblShopTitle.Location = New-Object System.Drawing.Point(10, 8)
+    $shopPanel.Controls.Add($lblShopTitle)
+
+    $shopGrid = New-Object System.Windows.Forms.Panel
+    $shopGrid.Location = New-Object System.Drawing.Point(10, 34)
+    $shopGrid.Size = New-Object System.Drawing.Size(696, 378)
+    $shopGrid.BackColor = [System.Drawing.Color]::FromArgb(26, 26, 30)
+    $shopPanel.Controls.Add($shopGrid)
+
+    $shopCols = 2
+    $btnWidth = 338
+    $btnHeight = 38
+    $colGap = 10
+    $rowGap = 3
+    $script:CookieShopCols = $shopCols
+    $script:CookieShopBtnWidth = $btnWidth
+    $script:CookieShopBtnHeight = $btnHeight
+    $script:CookieShopColGap = $colGap
+    $script:CookieShopRowGap = $rowGap
+    $upgradeIndex = 0
+
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        $btnUpgrade = New-Object System.Windows.Forms.Button
+        $btnUpgrade.Tag = $upgrade.Key
+        $col = $upgradeIndex % $shopCols
+        $row = [int][Math]::Floor($upgradeIndex / $shopCols)
+        $x = $col * ($btnWidth + $colGap)
+        $y = $row * ($btnHeight + $rowGap)
+        $btnUpgrade.Size = New-Object System.Drawing.Size($btnWidth, $btnHeight)
+        $btnUpgrade.Location = New-Object System.Drawing.Point($x, $y)
+        $btnUpgrade.FlatStyle = 'Flat'
+        $btnUpgrade.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+        $btnUpgrade.TextAlign = 'MiddleLeft'
+        $btnUpgrade.BackColor = [System.Drawing.Color]::FromArgb(117, 93, 183)
+        $btnUpgrade.ForeColor = [System.Drawing.Color]::FromArgb(244, 240, 255)
+        $btnUpgrade.Add_Click({
+            $upgradeKey = [string]$this.Tag
+            $purchased = Invoke-CookiePurchase -UpgradeKey $upgradeKey
+            if (-not $purchased) { [System.Media.SystemSounds]::Beep.Play() }
+        })
+        [void]$shopGrid.Controls.Add($btnUpgrade)
+        $script:CookieUpgradeButtons[$upgrade.Key] = $btnUpgrade
+        $upgradeIndex++
+    }
+
+    $lblLongevity = New-Object System.Windows.Forms.Label
+    $lblLongevity.Text = 'Milestone Unlocks: P3, P5, P10, P15'
+    $lblLongevity.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
+    $lblLongevity.ForeColor = [System.Drawing.Color]::FromArgb(210, 210, 240)
+    $lblLongevity.AutoSize = $true
+    $lblLongevity.Location = New-Object System.Drawing.Point(290, 538)
+    $script:tabSecret.Controls.Add($lblLongevity)
+
+    $script:lblMilestoneInfo = New-Object System.Windows.Forms.Label
+    $script:lblMilestoneInfo.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
+    $script:lblMilestoneInfo.ForeColor = [System.Drawing.Color]::FromArgb(224, 224, 242)
+    $script:lblMilestoneInfo.AutoSize = $true
+    $script:lblMilestoneInfo.Location = New-Object System.Drawing.Point(290, 566)
+    $script:tabSecret.Controls.Add($script:lblMilestoneInfo)
+
+    $script:lblPrestigePerks = New-Object System.Windows.Forms.Label
+    $script:lblPrestigePerks.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $script:lblPrestigePerks.ForeColor = [System.Drawing.Color]::FromArgb(214, 214, 236)
+    $script:lblPrestigePerks.AutoSize = $true
+    $script:lblPrestigePerks.Location = New-Object System.Drawing.Point(290, 590)
+    $script:tabSecret.Controls.Add($script:lblPrestigePerks)
+
+    $script:lblPrestigeMultipliers = New-Object System.Windows.Forms.Label
+    $script:lblPrestigeMultipliers.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $script:lblPrestigeMultipliers.ForeColor = [System.Drawing.Color]::FromArgb(222, 222, 246)
+    $script:lblPrestigeMultipliers.AutoSize = $true
+    $script:lblPrestigeMultipliers.Location = New-Object System.Drawing.Point(290, 612)
+    $script:tabSecret.Controls.Add($script:lblPrestigeMultipliers)
+
+    $script:lblAscensionInfo = New-Object System.Windows.Forms.Label
+    $script:lblAscensionInfo.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $script:lblAscensionInfo.ForeColor = [System.Drawing.Color]::FromArgb(236, 236, 252)
+    $script:lblAscensionInfo.AutoSize = $true
+    $script:lblAscensionInfo.Location = New-Object System.Drawing.Point(24, 638)
+    $script:tabSecret.Controls.Add($script:lblAscensionInfo)
+
+    $script:btnAscClick = New-Object System.Windows.Forms.Button
+    $script:btnAscClick.Size = New-Object System.Drawing.Size(220, 34)
+    $script:btnAscClick.Location = New-Object System.Drawing.Point(24, 666)
+    $script:btnAscClick.FlatStyle = 'Flat'
+    $script:btnAscClick.BackColor = [System.Drawing.Color]::FromArgb(124, 89, 188)
+    $script:btnAscClick.ForeColor = [System.Drawing.Color]::White
+    $script:tabSecret.Controls.Add($script:btnAscClick)
+
+    $script:btnAscAuto = New-Object System.Windows.Forms.Button
+    $script:btnAscAuto.Size = New-Object System.Drawing.Size(220, 34)
+    $script:btnAscAuto.Location = New-Object System.Drawing.Point(252, 666)
+    $script:btnAscAuto.FlatStyle = 'Flat'
+    $script:btnAscAuto.BackColor = [System.Drawing.Color]::FromArgb(100, 125, 192)
+    $script:btnAscAuto.ForeColor = [System.Drawing.Color]::White
+    $script:tabSecret.Controls.Add($script:btnAscAuto)
+
+    $script:btnAscEconomy = New-Object System.Windows.Forms.Button
+    $script:btnAscEconomy.Size = New-Object System.Drawing.Size(220, 34)
+    $script:btnAscEconomy.Location = New-Object System.Drawing.Point(480, 666)
+    $script:btnAscEconomy.FlatStyle = 'Flat'
+    $script:btnAscEconomy.BackColor = [System.Drawing.Color]::FromArgb(86, 153, 112)
+    $script:btnAscEconomy.ForeColor = [System.Drawing.Color]::White
+    $script:tabSecret.Controls.Add($script:btnAscEconomy)
+
+    $script:btnAscLuck = New-Object System.Windows.Forms.Button
+    $script:btnAscLuck.Size = New-Object System.Drawing.Size(220, 34)
+    $script:btnAscLuck.Location = New-Object System.Drawing.Point(708, 666)
+    $script:btnAscLuck.FlatStyle = 'Flat'
+    $script:btnAscLuck.BackColor = [System.Drawing.Color]::FromArgb(185, 122, 78)
+    $script:btnAscLuck.ForeColor = [System.Drawing.Color]::White
+    $script:tabSecret.Controls.Add($script:btnAscLuck)
+
+    $script:ascensionToolTip = New-Object System.Windows.Forms.ToolTip
+    $script:ascensionToolTip.AutoPopDelay = 8000
+    $script:ascensionToolTip.InitialDelay = 250
+    $script:ascensionToolTip.ReshowDelay = 100
+    $script:ascensionToolTip.ShowAlways = $true
+    $script:ascensionToolTip.SetToolTip($script:btnAscClick, (Get-CookieAscensionBranchDescription -Branch Click))
+    $script:ascensionToolTip.SetToolTip($script:btnAscAuto, (Get-CookieAscensionBranchDescription -Branch Automation))
+    $script:ascensionToolTip.SetToolTip($script:btnAscEconomy, (Get-CookieAscensionBranchDescription -Branch Economy))
+    $script:ascensionToolTip.SetToolTip($script:btnAscLuck, (Get-CookieAscensionBranchDescription -Branch Luck))
+
+    $script:lblAscensionHint = New-Object System.Windows.Forms.Label
+    $script:lblAscensionHint.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
+    $script:lblAscensionHint.ForeColor = [System.Drawing.Color]::FromArgb(232, 232, 248)
+    $script:lblAscensionHint.AutoSize = $false
+    $script:lblAscensionHint.Size = New-Object System.Drawing.Size(1000, 24)
+    $script:lblAscensionHint.Location = New-Object System.Drawing.Point(24, 704)
+    $script:lblAscensionHint.Text = "Hover ascension buttons to see full branch effects."
+    $script:tabSecret.Controls.Add($script:lblAscensionHint)
+
+    $script:lblCritInfo = New-Object System.Windows.Forms.Label
+    $script:lblCritInfo.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $script:lblCritInfo.ForeColor = [System.Drawing.Color]::FromArgb(214, 214, 236)
+    $script:lblCritInfo.AutoSize = $true
+    $script:lblCritInfo.Location = New-Object System.Drawing.Point(480, 706)
+    $script:tabSecret.Controls.Add($script:lblCritInfo)
+
+    $script:btnCookieClick.Add_Click({
+        $clickValue = [double]$script:CookiesPerClick
+        if ((Get-Random -Minimum 0.0 -Maximum 1.0) -lt $script:CookieCritChance) {
+            $clickValue *= $script:CookieCritMultiplier
+            Show-CookieEventBanner -Message "CRIT CLICK! +$(Format-CookieNumber -Value $clickValue)" -BackColor ([System.Drawing.Color]::FromArgb(177, 121, 68))
+        }
+        $script:CookieCount += $clickValue
+        Update-CookieClickerUi
+    })
+
+    $script:btnPrestige.Add_Click({
+        [void](Invoke-CookiePrestige)
+    })
+
+    $script:btnCookieSaveNow.Add_Click({
+        [void](Invoke-CookieSaveNow)
+    })
+
+    $script:btnCookieStartOver.Add_Click({
+        [void](Invoke-CookieStartOver)
+    })
+
+    $script:btnAscClick.Add_Click({ [void](Invoke-CookieAscensionBuy -Branch Click) })
+    $script:btnAscAuto.Add_Click({ [void](Invoke-CookieAscensionBuy -Branch Automation) })
+    $script:btnAscEconomy.Add_Click({ [void](Invoke-CookieAscensionBuy -Branch Economy) })
+    $script:btnAscLuck.Add_Click({ [void](Invoke-CookieAscensionBuy -Branch Luck) })
+
+    $script:cookieTimer = New-Object System.Windows.Forms.Timer
+    $script:cookieTimer.Interval = 250
+    $script:cookieTimer.Add_Tick({
+        if ($script:CookiesPerSecond -gt 0) {
+            $script:CookieCount += ($script:CookiesPerSecond / 4.0)
+            Update-CookieClickerUi
+        }
+        if ($script:lblCookieEvent -and $script:lblCookieEvent.Visible -and $script:cookieEventHideAt -and ((Get-Date) -ge $script:cookieEventHideAt)) {
+            $script:lblCookieEvent.Visible = $false
+        }
+    })
+    $script:cookieTimer.Start()
+
+    Update-CookieClickerUi
+    [void]$TabControl.TabPages.Add($script:tabSecret)
+    $script:SecretTabCreated = $true
+    return $script:tabSecret
+}
+
+# -----------------------------
+# Credential prompt first
+# -----------------------------
+try {
+    $script:AdminCredential = Get-Credential -Message 'Enter the admin credentials to use for Joe''s System Services.'
+    if (-not $script:AdminCredential) {
+        throw 'No credentials were provided. Exiting.'
+    }
+}
+catch {
+    [System.Windows.Forms.MessageBox]::Show('Joe''s System Services cannot start without credentials.', 'Joe''s System Services', 'OK', 'Error') | Out-Null
+    return
+}
+
+# -----------------------------
+# Form setup
+# -----------------------------
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "$($script:AppName)  v$($script:Version)"
+$form.Size = New-Object System.Drawing.Size(1120, 900)
+$form.StartPosition = 'CenterScreen'
+$form.BackColor = [System.Drawing.Color]::FromArgb(236, 245, 244)
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+$form.FormBorderStyle = 'Sizable'
+$form.MaximizeBox = $true
+$form.Add_Shown({
+    # Bring the app to the foreground after it is rendered.
+    $form.Activate()
+    $form.BringToFront()
+    $form.TopMost = $true
+    $form.TopMost = $false
+})
+
+$headerPanel = New-Object System.Windows.Forms.Panel
+$headerPanel.Dock = 'Top'
+$headerPanel.Height = 76
+$headerPanel.BackColor = $script:HeaderColor
+$form.Controls.Add($headerPanel)
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = "Joe's System Services"
+$lblTitle.ForeColor = [System.Drawing.Color]::White
+$lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 24)
+$lblTitle.AutoSize = $true
+$lblTitle.Location = New-Object System.Drawing.Point(20, 2)
+$headerPanel.Controls.Add($lblTitle)
+
+$lblSubTitle = New-Object System.Windows.Forms.Label
+$lblSubTitle.Text = 'Remote systems support with info, general tasks, profile cleanup, BitLocker, popups, and more!'
+$lblSubTitle.ForeColor = [System.Drawing.Color]::WhiteSmoke
+$lblSubTitle.Font = New-Object System.Drawing.Font('Segoe UI', 12)
+$lblSubTitle.AutoSize = $true
+$lblSubTitle.Location = New-Object System.Drawing.Point(24, 50)
+$headerPanel.Controls.Add($lblSubTitle)
+
+$tabs = New-Object System.Windows.Forms.TabControl
+$tabs.Location = New-Object System.Drawing.Point(15, 92)
+$tabs.Size = New-Object System.Drawing.Size(1075, 635)
+$tabs.Anchor = 'Top, Bottom, Left, Right'
+$form.Controls.Add($tabs)
+
+# -----------------------------
+# Welcome tab
+# -----------------------------
+$tabWelcome = New-Object System.Windows.Forms.TabPage
+$tabWelcome.Text = 'Welcome'
+$tabWelcome.BackColor = [System.Drawing.Color]::FromArgb(244, 250, 249)
+$tabs.TabPages.Add($tabWelcome)
+
+$welcomeCard = New-Object System.Windows.Forms.Panel
+$welcomeCard.Location = New-Object System.Drawing.Point(30, 30)
+$welcomeCard.Size = New-Object System.Drawing.Size(975, 525)
+$welcomeCard.BackColor = [System.Drawing.Color]::White
+$tabWelcome.Controls.Add($welcomeCard)
+
+$lblWelcome = New-Object System.Windows.Forms.Label
+$lblWelcome.Text = "Welcome to Joe's System Services $($script:AdminCredential.UserName)!"
+$lblWelcome.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 24)
+$lblWelcome.AutoSize = $true
+$lblWelcome.Location = New-Object System.Drawing.Point(28, 15)
+$lblWelcome.ForeColor = [System.Drawing.Color]::FromArgb(55, 94, 89)
+$welcomeCard.Controls.Add($lblWelcome)
+
+$lblWelcome2 = New-Object System.Windows.Forms.Label
+$lblWelcome2.Text = @"
+This tool is designed to help with common remote system actions in a cleaner way.
+
+Included right now:
+• System Info collection
+• General remote actions like restart, shutdown, gpupdate, and ipconfig tasks
+• Check pending Windows updates (without installing)
+• Install pending Windows updates on one or many targets
+• Delete user profiles remotely
+• Run your existing BitLocker enablement workflow remotely
+• Pull archived BitLocker keys from the share
+• Ping/test target systems before taking action
+• Send pop-up messages to one or many users (manual list or .txt list)
+• Settings tab with theme colors, tab order controls, and per-user saved profiles
+• Now with NIGHT MODE!
+
+Use the tabs above to get started.
+"@
+$lblWelcome2.Font = New-Object System.Drawing.Font('Segoe UI', 14)
+$lblWelcome2.Size = New-Object System.Drawing.Size(900, 395)
+$lblWelcome2.Location = New-Object System.Drawing.Point(33, 100)
+$lblWelcome2.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+$welcomeCard.Controls.Add($lblWelcome2)
+
+$lblCred = New-Object System.Windows.Forms.Label
+$lblCred.Text = ""
+$lblCred.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+$lblCred.AutoSize = $true
+$lblCred.Location = New-Object System.Drawing.Point(35, 485)
+$lblCred.ForeColor = [System.Drawing.Color]::FromArgb(86, 144, 133)
+$welcomeCard.Controls.Add($lblCred)
+
+# -----------------------------
+# System Info tab (with Popup Messages)
+# -----------------------------
+$tabSystemInfo = New-Object System.Windows.Forms.TabPage
+$tabSystemInfo.Text = 'System Info / Popup'
+$tabSystemInfo.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabSystemInfo)
+
+# Structured lookup header area
+$grpSystemLookup = New-Object System.Windows.Forms.GroupBox
+$grpSystemLookup.Text = 'System Lookup'
+$grpSystemLookup.Location = New-Object System.Drawing.Point(20, 10)
+$grpSystemLookup.Size = New-Object System.Drawing.Size(1015, 52)
+$grpSystemLookup.Anchor = 'Top, Left, Right'
+$tabSystemInfo.Controls.Add($grpSystemLookup)
+
+$lblSComputer = New-Object System.Windows.Forms.Label
+$lblSComputer.Text = 'Computer Name:'
+$lblSComputer.Location = New-Object System.Drawing.Point(15, 23)
+$lblSComputer.AutoSize = $true
+$grpSystemLookup.Controls.Add($lblSComputer)
+
+$txtSComputer = New-Object System.Windows.Forms.TextBox
+$txtSComputer.Location = New-Object System.Drawing.Point(125, 19)
+$txtSComputer.Size = New-Object System.Drawing.Size(220, 28)
+$txtSComputer.Text = ''
+$grpSystemLookup.Controls.Add($txtSComputer)
+
+$btnSPing = New-Object System.Windows.Forms.Button
+$btnSPing.Text = 'Ping/Test Connection'
+$btnSPing.Location = New-Object System.Drawing.Point(365, 17)
+$btnSPing.Size = New-Object System.Drawing.Size(150, 34)
+$btnSPing.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnSPing.FlatStyle = 'Flat'
+$grpSystemLookup.Controls.Add($btnSPing)
+
+$btnSLoad = New-Object System.Windows.Forms.Button
+$btnSLoad.Text = 'Load System Info'
+$btnSLoad.Location = New-Object System.Drawing.Point(530, 17)
+$btnSLoad.Size = New-Object System.Drawing.Size(140, 34)
+$btnSLoad.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnSLoad.FlatStyle = 'Flat'
+$grpSystemLookup.Controls.Add($btnSLoad)
+
+$grpSystemDetails = New-Object System.Windows.Forms.GroupBox
+$grpSystemDetails.Text = 'System Properties'
+$grpSystemDetails.Location = New-Object System.Drawing.Point(20, 70)
+$grpSystemDetails.Size = New-Object System.Drawing.Size(760, 220)
+$grpSystemDetails.Anchor = 'Top, Left'
+$tabSystemInfo.Controls.Add($grpSystemDetails)
+
+$dgvSystemInfo = New-Object System.Windows.Forms.DataGridView
+$dgvSystemInfo.Location = New-Object System.Drawing.Point(15, 28)
+$dgvSystemInfo.Size = New-Object System.Drawing.Size(730, 180)
+$dgvSystemInfo.AllowUserToAddRows = $false
+$dgvSystemInfo.AllowUserToDeleteRows = $false
+$dgvSystemInfo.ReadOnly = $true
+$dgvSystemInfo.SelectionMode = 'FullRowSelect'
+$dgvSystemInfo.MultiSelect = $false
+$dgvSystemInfo.AutoSizeColumnsMode = 'None'
+$dgvSystemInfo.RowHeadersVisible = $false
+$dgvSystemInfo.Anchor = 'Top, Left'
+$grpSystemDetails.Controls.Add($dgvSystemInfo)
+
+$tableSystemInfo = New-Object System.Data.DataTable
+[void]$tableSystemInfo.Columns.Add('Property', [string])
+[void]$tableSystemInfo.Columns.Add('Value', [string])
+$dgvSystemInfo.DataSource = $tableSystemInfo
+$dgvSystemInfo.Columns['Property'].Width = 220
+$dgvSystemInfo.Columns['Value'].Width = 490
+
+# Popup Message controls below System Info
+$grpPopup = New-Object System.Windows.Forms.GroupBox
+$grpPopup.Text = 'Send Popup Message'
+$grpPopup.Location = New-Object System.Drawing.Point(20, 300)
+$grpPopup.Size = New-Object System.Drawing.Size(1015, 270)
+$grpPopup.Anchor = 'Top, Bottom, Left, Right'
+$tabSystemInfo.Controls.Add($grpPopup)
+
+$lblPasteComputers = New-Object System.Windows.Forms.Label
+$lblPasteComputers.Text = "Target computer names (one per line or comma separated):"
+$lblPasteComputers.Location = New-Object System.Drawing.Point(15, 30)
+$lblPasteComputers.Size = New-Object System.Drawing.Size(395, 22)
+$grpPopup.Controls.Add($lblPasteComputers)
+
+$txtPopupComputers = New-Object System.Windows.Forms.TextBox
+$txtPopupComputers.Location = New-Object System.Drawing.Point(15, 55)
+$txtPopupComputers.Size = New-Object System.Drawing.Size(470, 62)
+$txtPopupComputers.Multiline = $true
+$txtPopupComputers.ScrollBars = 'Vertical'
+$txtPopupComputers.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($txtPopupComputers)
+
+$lblCompFile = New-Object System.Windows.Forms.Label
+$lblCompFile.Text = "Optional: .txt file path with computer names"
+$lblCompFile.Location = New-Object System.Drawing.Point(505, 30)
+$lblCompFile.Size = New-Object System.Drawing.Size(300, 22)
+$grpPopup.Controls.Add($lblCompFile)
+
+$txtCompFilePath = New-Object System.Windows.Forms.TextBox
+$txtCompFilePath.Location = New-Object System.Drawing.Point(505, 55)
+$txtCompFilePath.Size = New-Object System.Drawing.Size(350, 30)
+$txtCompFilePath.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($txtCompFilePath)
+
+$btnBrowseCompFile = New-Object System.Windows.Forms.Button
+$btnBrowseCompFile.Text = "Browse..."
+$btnBrowseCompFile.Location = New-Object System.Drawing.Point(865, 54)
+$btnBrowseCompFile.Size = New-Object System.Drawing.Size(85, 28)
+$btnBrowseCompFile.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnBrowseCompFile.FlatStyle = 'Flat'
+$btnBrowseCompFile.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($btnBrowseCompFile)
+
+$lblPopupHint = New-Object System.Windows.Forms.Label
+$lblPopupHint.Text = "Tip: You can combine both input box and file list in one send."
+$lblPopupHint.Location = New-Object System.Drawing.Point(15, 124)
+$lblPopupHint.Size = New-Object System.Drawing.Size(440, 20)
+$lblPopupHint.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpPopup.Controls.Add($lblPopupHint)
+
+$lblPopupMsg = New-Object System.Windows.Forms.Label
+$lblPopupMsg.Text = "Popup Message to Send:"
+$lblPopupMsg.Location = New-Object System.Drawing.Point(15, 148)
+$lblPopupMsg.Size = New-Object System.Drawing.Size(250, 22)
+$grpPopup.Controls.Add($lblPopupMsg)
+
+$txtPopupMsg = New-Object System.Windows.Forms.TextBox
+$txtPopupMsg.Location = New-Object System.Drawing.Point(15, 173)
+$txtPopupMsg.Size = New-Object System.Drawing.Size(760, 44)
+$txtPopupMsg.Multiline = $true
+$txtPopupMsg.ScrollBars = 'Vertical'
+$txtPopupMsg.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($txtPopupMsg)
+
+$btnSendPopup = New-Object System.Windows.Forms.Button
+$btnSendPopup.Text = "Send Message"
+$btnSendPopup.Location = New-Object System.Drawing.Point(790, 173)
+$btnSendPopup.Size = New-Object System.Drawing.Size(170, 44)
+$btnSendPopup.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnSendPopup.FlatStyle = 'Flat'
+$btnSendPopup.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($btnSendPopup)
+
+$lblPopupTargetCount = New-Object System.Windows.Forms.Label
+$lblPopupTargetCount.Text = "Targets detected: 0"
+$lblPopupTargetCount.Location = New-Object System.Drawing.Point(790, 224)
+$lblPopupTargetCount.Size = New-Object System.Drawing.Size(220, 22)
+$lblPopupTargetCount.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+$lblPopupTargetCount.Anchor = 'Top, Left'
+$grpPopup.Controls.Add($lblPopupTargetCount)
+
+# -----------------------------
+# General tab
+# -----------------------------
+$tabGeneral = New-Object System.Windows.Forms.TabPage
+$tabGeneral.Text = 'General'
+$tabGeneral.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabGeneral)
+
+$lblGComputer = New-Object System.Windows.Forms.Label
+$lblGComputer.Text = 'Computer Name:'
+$lblGComputer.Location = New-Object System.Drawing.Point(20, 20)
+$lblGComputer.AutoSize = $true
+$tabGeneral.Controls.Add($lblGComputer)
+
+$txtGComputer = New-Object System.Windows.Forms.TextBox
+$txtGComputer.Location = New-Object System.Drawing.Point(140, 16)
+$txtGComputer.Size = New-Object System.Drawing.Size(220, 28)
+$txtGComputer.Text = ''
+$tabGeneral.Controls.Add($txtGComputer)
+
+$btnGPing = New-Object System.Windows.Forms.Button
+$btnGPing.Text = 'Ping/Test Connection'
+$btnGPing.Location = New-Object System.Drawing.Point(380, 14)
+$btnGPing.Size = New-Object System.Drawing.Size(150, 34)
+$btnGPing.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnGPing.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnGPing)
+
+$btnRestart = New-Object System.Windows.Forms.Button
+$btnRestart.Text = 'Restart'
+$btnRestart.Location = New-Object System.Drawing.Point(20, 70)
+$btnRestart.Size = New-Object System.Drawing.Size(130, 38)
+$btnRestart.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnRestart.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnRestart)
+
+$btnShutdown = New-Object System.Windows.Forms.Button
+$btnShutdown.Text = 'Shutdown'
+$btnShutdown.Location = New-Object System.Drawing.Point(165, 70)
+$btnShutdown.Size = New-Object System.Drawing.Size(130, 38)
+$btnShutdown.BackColor = [System.Drawing.Color]::FromArgb(226, 196, 196)
+$btnShutdown.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnShutdown)
+
+$btnGPUpdate = New-Object System.Windows.Forms.Button
+$btnGPUpdate.Text = 'GPUpdate /Force'
+$btnGPUpdate.Location = New-Object System.Drawing.Point(20, 125)
+$btnGPUpdate.Size = New-Object System.Drawing.Size(130, 38)
+$btnGPUpdate.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnGPUpdate.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnGPUpdate)
+
+$btnIPConfig = New-Object System.Windows.Forms.Button
+$btnIPConfig.Text = 'IPConfig /All'
+$btnIPConfig.Location = New-Object System.Drawing.Point(165, 125)
+$btnIPConfig.Size = New-Object System.Drawing.Size(130, 38)
+$btnIPConfig.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnIPConfig.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnIPConfig)
+
+$btnFlushDNS = New-Object System.Windows.Forms.Button
+$btnFlushDNS.Text = 'Flush DNS'
+$btnFlushDNS.Location = New-Object System.Drawing.Point(310, 125)
+$btnFlushDNS.Size = New-Object System.Drawing.Size(130, 38)
+$btnFlushDNS.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnFlushDNS.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnFlushDNS)
+
+$btnReleaseRenew = New-Object System.Windows.Forms.Button
+$btnReleaseRenew.Text = 'Release / Renew'
+$btnReleaseRenew.Location = New-Object System.Drawing.Point(455, 125)
+$btnReleaseRenew.Size = New-Object System.Drawing.Size(130, 38)
+$btnReleaseRenew.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnReleaseRenew.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnReleaseRenew)
+
+$btnGWindowsUpdateCheck = New-Object System.Windows.Forms.Button
+$btnGWindowsUpdateCheck.Text = 'Check Windows Updates'
+$btnGWindowsUpdateCheck.Location = New-Object System.Drawing.Point(600, 125)
+$btnGWindowsUpdateCheck.Size = New-Object System.Drawing.Size(185, 38)
+$btnGWindowsUpdateCheck.BackColor = [System.Drawing.Color]::FromArgb(245, 223, 168)
+$btnGWindowsUpdateCheck.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnGWindowsUpdateCheck)
+
+$btnGWindowsUpdate = New-Object System.Windows.Forms.Button
+$btnGWindowsUpdate.Text = 'Install Windows Updates'
+$btnGWindowsUpdate.Location = New-Object System.Drawing.Point(800, 125)
+$btnGWindowsUpdate.Size = New-Object System.Drawing.Size(185, 38)
+$btnGWindowsUpdate.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnGWindowsUpdate.FlatStyle = 'Flat'
+$tabGeneral.Controls.Add($btnGWindowsUpdate)
+
+$lblGeneralOutput = New-Object System.Windows.Forms.Label
+$lblGeneralOutput.Text = 'Command Output:'
+$lblGeneralOutput.Location = New-Object System.Drawing.Point(20, 185)
+$lblGeneralOutput.AutoSize = $true
+$tabGeneral.Controls.Add($lblGeneralOutput)
+
+$txtGeneralOutput = New-Object System.Windows.Forms.TextBox
+$txtGeneralOutput.Location = New-Object System.Drawing.Point(20, 210)
+$txtGeneralOutput.Size = New-Object System.Drawing.Size(1015, 260)
+$txtGeneralOutput.Multiline = $true
+$txtGeneralOutput.ScrollBars = 'Vertical'
+$txtGeneralOutput.ReadOnly = $true
+$txtGeneralOutput.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 250)
+$txtGeneralOutput.Font = New-Object System.Drawing.Font('Consolas', 9)
+$tabGeneral.Controls.Add($txtGeneralOutput)
+
+# -----------------------------
+# Delete User Profile tab
+# -----------------------------
+$tabDelete = New-Object System.Windows.Forms.TabPage
+$tabDelete.Text = 'Delete User Profile'
+$tabDelete.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabDelete)
+
+$lblDeleteComputer = New-Object System.Windows.Forms.Label
+$lblDeleteComputer.Text = 'Computer Name:'
+$lblDeleteComputer.Location = New-Object System.Drawing.Point(20, 20)
+$lblDeleteComputer.AutoSize = $true
+$tabDelete.Controls.Add($lblDeleteComputer)
+
+$txtDeleteComputer = New-Object System.Windows.Forms.TextBox
+$txtDeleteComputer.Location = New-Object System.Drawing.Point(140, 16)
+$txtDeleteComputer.Size = New-Object System.Drawing.Size(220, 28)
+$txtDeleteComputer.Text = ''
+$tabDelete.Controls.Add($txtDeleteComputer)
+
+$btnDeletePing = New-Object System.Windows.Forms.Button
+$btnDeletePing.Text = 'Ping/Test Connection'
+$btnDeletePing.Location = New-Object System.Drawing.Point(380, 14)
+$btnDeletePing.Size = New-Object System.Drawing.Size(150, 34)
+$btnDeletePing.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnDeletePing.FlatStyle = 'Flat'
+$tabDelete.Controls.Add($btnDeletePing)
+
+$btnLoadProfiles = New-Object System.Windows.Forms.Button
+$btnLoadProfiles.Text = 'Load Profiles'
+$btnLoadProfiles.Location = New-Object System.Drawing.Point(545, 14)
+$btnLoadProfiles.Size = New-Object System.Drawing.Size(120, 34)
+$btnLoadProfiles.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnLoadProfiles.FlatStyle = 'Flat'
+$tabDelete.Controls.Add($btnLoadProfiles)
+
+$btnDeleteProfiles = New-Object System.Windows.Forms.Button
+$btnDeleteProfiles.Text = 'Delete Selected'
+$btnDeleteProfiles.Location = New-Object System.Drawing.Point(680, 14)
+$btnDeleteProfiles.Size = New-Object System.Drawing.Size(130, 34)
+$btnDeleteProfiles.BackColor = [System.Drawing.Color]::FromArgb(226, 196, 196)
+$btnDeleteProfiles.FlatStyle = 'Flat'
+$tabDelete.Controls.Add($btnDeleteProfiles)
+
+$dgvProfiles = New-Object System.Windows.Forms.DataGridView
+$dgvProfiles.Location = New-Object System.Drawing.Point(20, 65)
+$dgvProfiles.Size = New-Object System.Drawing.Size(1015, 420)
+$dgvProfiles.AllowUserToAddRows = $false
+$dgvProfiles.AllowUserToDeleteRows = $false
+$dgvProfiles.ReadOnly = $false
+$dgvProfiles.SelectionMode = 'FullRowSelect'
+$dgvProfiles.MultiSelect = $true
+$dgvProfiles.AutoSizeColumnsMode = 'Fill'
+$dgvProfiles.RowHeadersVisible = $false
+$tabDelete.Controls.Add($dgvProfiles)
+
+$tableProfiles = New-Object System.Data.DataTable
+[void]$tableProfiles.Columns.Add('Select', [bool])
+[void]$tableProfiles.Columns.Add('UserName', [string])
+[void]$tableProfiles.Columns.Add('LocalPath', [string])
+[void]$tableProfiles.Columns.Add('SID', [string])
+[void]$tableProfiles.Columns.Add('Loaded', [string])
+[void]$tableProfiles.Columns.Add('LastUseTime', [string])
+$dgvProfiles.DataSource = $tableProfiles
+
+# -----------------------------
+# BitLocker tab
+# -----------------------------
+$tabBitLocker = New-Object System.Windows.Forms.TabPage
+$tabBitLocker.Text = 'BitLocker'
+$tabBitLocker.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabBitLocker)
+
+$lblBLComputer = New-Object System.Windows.Forms.Label
+$lblBLComputer.Text = 'Computer Name:'
+$lblBLComputer.Location = New-Object System.Drawing.Point(20, 20)
+$lblBLComputer.AutoSize = $true
+$tabBitLocker.Controls.Add($lblBLComputer)
+
+$txtBLComputer = New-Object System.Windows.Forms.TextBox
+$txtBLComputer.Location = New-Object System.Drawing.Point(140, 16)
+$txtBLComputer.Size = New-Object System.Drawing.Size(220, 28)
+$txtBLComputer.Text = ''
+$tabBitLocker.Controls.Add($txtBLComputer)
+
+$btnBLPing = New-Object System.Windows.Forms.Button
+$btnBLPing.Text = 'Ping/Test Connection'
+$btnBLPing.Location = New-Object System.Drawing.Point(380, 14)
+$btnBLPing.Size = New-Object System.Drawing.Size(150, 34)
+$btnBLPing.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnBLPing.FlatStyle = 'Flat'
+$tabBitLocker.Controls.Add($btnBLPing)
+
+$btnEnableBL = New-Object System.Windows.Forms.Button
+$btnEnableBL.Text = 'Enable BitLocker'
+$btnEnableBL.Location = New-Object System.Drawing.Point(545, 14)
+$btnEnableBL.Size = New-Object System.Drawing.Size(140, 34)
+$btnEnableBL.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnEnableBL.FlatStyle = 'Flat'
+$tabBitLocker.Controls.Add($btnEnableBL)
+
+$lblBLKey = New-Object System.Windows.Forms.Label
+$lblBLKey.Text = 'Recovery Key:'
+$lblBLKey.Location = New-Object System.Drawing.Point(20, 70)
+$lblBLKey.AutoSize = $true
+$tabBitLocker.Controls.Add($lblBLKey)
+
+$txtBLKey = New-Object System.Windows.Forms.TextBox
+$txtBLKey.Location = New-Object System.Drawing.Point(20, 95)
+$txtBLKey.Size = New-Object System.Drawing.Size(1015, 32)
+$txtBLKey.ReadOnly = $true
+$txtBLKey.Font = New-Object System.Drawing.Font('Consolas', 12)
+$txtBLKey.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 250)
+$tabBitLocker.Controls.Add($txtBLKey)
+
+$lblBLFile = New-Object System.Windows.Forms.Label
+$lblBLFile.Text = 'BitLocker Output:'
+$lblBLFile.Location = New-Object System.Drawing.Point(20, 145)
+$lblBLFile.AutoSize = $true
+$tabBitLocker.Controls.Add($lblBLFile)
+
+$txtBLFile = New-Object System.Windows.Forms.TextBox
+$txtBLFile.Location = New-Object System.Drawing.Point(20, 170)
+$txtBLFile.Size = New-Object System.Drawing.Size(1015, 190)
+$txtBLFile.Multiline = $true
+$txtBLFile.ScrollBars = 'Vertical'
+$txtBLFile.ReadOnly = $true
+$txtBLFile.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 250)
+$tabBitLocker.Controls.Add($txtBLFile)
+
+$btnBLReboot = New-Object System.Windows.Forms.Button
+$btnBLReboot.Text = 'Proceed With Reboot'
+$btnBLReboot.Location = New-Object System.Drawing.Point(20, 372)
+$btnBLReboot.Size = New-Object System.Drawing.Size(180, 34)
+$btnBLReboot.BackColor = [System.Drawing.Color]::FromArgb(226, 196, 196)
+$btnBLReboot.FlatStyle = 'Flat'
+$btnBLReboot.Enabled = $false
+$tabBitLocker.Controls.Add($btnBLReboot)
+
+$grpBLLookup = New-Object System.Windows.Forms.GroupBox
+$grpBLLookup.Text = 'Pull Archived BitLocker Key'
+$grpBLLookup.Location = New-Object System.Drawing.Point(20, 420)
+$grpBLLookup.Size = New-Object System.Drawing.Size(1015, 70)
+$tabBitLocker.Controls.Add($grpBLLookup)
+
+$lblBLLookup = New-Object System.Windows.Forms.Label
+$lblBLLookup.Text = 'Computer Name:'
+$lblBLLookup.Location = New-Object System.Drawing.Point(15, 30)
+$lblBLLookup.AutoSize = $true
+$grpBLLookup.Controls.Add($lblBLLookup)
+
+$txtBLLookupComputer = New-Object System.Windows.Forms.TextBox
+$txtBLLookupComputer.Location = New-Object System.Drawing.Point(130, 26)
+$txtBLLookupComputer.Size = New-Object System.Drawing.Size(220, 28)
+$txtBLLookupComputer.Text = ''
+$grpBLLookup.Controls.Add($txtBLLookupComputer)
+
+$btnBLLookup = New-Object System.Windows.Forms.Button
+$btnBLLookup.Text = 'Get Archived Key'
+$btnBLLookup.Location = New-Object System.Drawing.Point(370, 24)
+$btnBLLookup.Size = New-Object System.Drawing.Size(140, 32)
+$btnBLLookup.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnBLLookup.FlatStyle = 'Flat'
+$grpBLLookup.Controls.Add($btnBLLookup)
+
+# -----------------------------
+# Account Management tab
+# -----------------------------
+$tabAccounts = New-Object System.Windows.Forms.TabPage
+$tabAccounts.Text = 'Account Management'
+$tabAccounts.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabAccounts)
+
+$grpCreateAccount = New-Object System.Windows.Forms.GroupBox
+$grpCreateAccount.Text = 'Create AD Account'
+$grpCreateAccount.Location = New-Object System.Drawing.Point(20, 20)
+$grpCreateAccount.Size = New-Object System.Drawing.Size(1015, 220)
+$tabAccounts.Controls.Add($grpCreateAccount)
+
+$lblAcctFirstName = New-Object System.Windows.Forms.Label
+$lblAcctFirstName.Text = 'First Name:'
+$lblAcctFirstName.Location = New-Object System.Drawing.Point(16, 35)
+$lblAcctFirstName.AutoSize = $true
+$grpCreateAccount.Controls.Add($lblAcctFirstName)
+
+$txtAcctFirstName = New-Object System.Windows.Forms.TextBox
+$txtAcctFirstName.Location = New-Object System.Drawing.Point(105, 31)
+$txtAcctFirstName.Size = New-Object System.Drawing.Size(220, 28)
+$grpCreateAccount.Controls.Add($txtAcctFirstName)
+
+$lblAcctLastName = New-Object System.Windows.Forms.Label
+$lblAcctLastName.Text = 'Last Name:'
+$lblAcctLastName.Location = New-Object System.Drawing.Point(350, 35)
+$lblAcctLastName.AutoSize = $true
+$grpCreateAccount.Controls.Add($lblAcctLastName)
+
+$txtAcctLastName = New-Object System.Windows.Forms.TextBox
+$txtAcctLastName.Location = New-Object System.Drawing.Point(435, 31)
+$txtAcctLastName.Size = New-Object System.Drawing.Size(220, 28)
+$grpCreateAccount.Controls.Add($txtAcctLastName)
+
+$lblAcctOu = New-Object System.Windows.Forms.Label
+$lblAcctOu.Text = 'PL2 OU:'
+$lblAcctOu.Location = New-Object System.Drawing.Point(680, 35)
+$lblAcctOu.AutoSize = $true
+$grpCreateAccount.Controls.Add($lblAcctOu)
+
+$txtAcctOu = New-Object System.Windows.Forms.TextBox
+$txtAcctOu.Location = New-Object System.Drawing.Point(740, 31)
+$txtAcctOu.Size = New-Object System.Drawing.Size(150, 28)
+$txtAcctOu.Text = 'PLACEHOLDER'
+$grpCreateAccount.Controls.Add($txtAcctOu)
+
+$lblAcctPassword = New-Object System.Windows.Forms.Label
+$lblAcctPassword.Text = 'Initial Password:'
+$lblAcctPassword.Location = New-Object System.Drawing.Point(16, 78)
+$lblAcctPassword.AutoSize = $true
+$grpCreateAccount.Controls.Add($lblAcctPassword)
+
+$txtAcctPassword = New-Object System.Windows.Forms.TextBox
+$txtAcctPassword.Location = New-Object System.Drawing.Point(140, 74)
+$txtAcctPassword.Size = New-Object System.Drawing.Size(220, 28)
+$txtAcctPassword.Text = 'Enter Password HERE'
+$grpCreateAccount.Controls.Add($txtAcctPassword)
+
+$lblAcctDomain = New-Object System.Windows.Forms.Label
+$lblAcctDomain.Text = 'Domain DN:'
+$lblAcctDomain.Location = New-Object System.Drawing.Point(390, 78)
+$lblAcctDomain.AutoSize = $true
+$grpCreateAccount.Controls.Add($lblAcctDomain)
+
+$txtAcctDomain = New-Object System.Windows.Forms.TextBox
+$txtAcctDomain.Location = New-Object System.Drawing.Point(475, 74)
+$txtAcctDomain.Size = New-Object System.Drawing.Size(250, 28)
+$txtAcctDomain.Text = 'DC=PLACEHOLDER,DC=secure'
+$grpCreateAccount.Controls.Add($txtAcctDomain)
+
+$btnCreateAccount = New-Object System.Windows.Forms.Button
+$btnCreateAccount.Text = 'Create Account'
+$btnCreateAccount.Location = New-Object System.Drawing.Point(16, 123)
+$btnCreateAccount.Size = New-Object System.Drawing.Size(160, 34)
+$btnCreateAccount.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnCreateAccount.FlatStyle = 'Flat'
+$grpCreateAccount.Controls.Add($btnCreateAccount)
+
+$lblAcctPreview = New-Object System.Windows.Forms.Label
+$lblAcctPreview.Text = 'Username and display name are auto-generated based on first/last/OU rules.'
+$lblAcctPreview.Location = New-Object System.Drawing.Point(16, 170)
+$lblAcctPreview.Size = New-Object System.Drawing.Size(940, 24)
+$lblAcctPreview.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpCreateAccount.Controls.Add($lblAcctPreview)
+
+$grpDeleteAccount = New-Object System.Windows.Forms.GroupBox
+$grpDeleteAccount.Text = 'Delete AD Account'
+$grpDeleteAccount.Location = New-Object System.Drawing.Point(20, 255)
+$grpDeleteAccount.Size = New-Object System.Drawing.Size(1015, 300)
+$tabAccounts.Controls.Add($grpDeleteAccount)
+
+$lblSearchAdUser = New-Object System.Windows.Forms.Label
+$lblSearchAdUser.Text = 'Search AD User:'
+$lblSearchAdUser.Location = New-Object System.Drawing.Point(16, 34)
+$lblSearchAdUser.AutoSize = $true
+$grpDeleteAccount.Controls.Add($lblSearchAdUser)
+
+$txtSearchAdUser = New-Object System.Windows.Forms.TextBox
+$txtSearchAdUser.Location = New-Object System.Drawing.Point(120, 30)
+$txtSearchAdUser.Size = New-Object System.Drawing.Size(260, 28)
+$grpDeleteAccount.Controls.Add($txtSearchAdUser)
+
+$btnSearchADUsers = New-Object System.Windows.Forms.Button
+$btnSearchADUsers.Text = 'Search AD'
+$btnSearchADUsers.Location = New-Object System.Drawing.Point(395, 28)
+$btnSearchADUsers.Size = New-Object System.Drawing.Size(120, 32)
+$btnSearchADUsers.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnSearchADUsers.FlatStyle = 'Flat'
+$grpDeleteAccount.Controls.Add($btnSearchADUsers)
+
+$lblDeleteAcctUser = New-Object System.Windows.Forms.Label
+$lblDeleteAcctUser.Text = 'Username (sAMAccountName):'
+$lblDeleteAcctUser.Location = New-Object System.Drawing.Point(16, 76)
+$lblDeleteAcctUser.AutoSize = $true
+$grpDeleteAccount.Controls.Add($lblDeleteAcctUser)
+
+$txtDeleteAcctUser = New-Object System.Windows.Forms.TextBox
+$txtDeleteAcctUser.Location = New-Object System.Drawing.Point(225, 72)
+$txtDeleteAcctUser.Size = New-Object System.Drawing.Size(250, 28)
+$grpDeleteAccount.Controls.Add($txtDeleteAcctUser)
+
+$btnUseSelectedADUser = New-Object System.Windows.Forms.Button
+$btnUseSelectedADUser.Text = 'Use Selected'
+$btnUseSelectedADUser.Location = New-Object System.Drawing.Point(490, 70)
+$btnUseSelectedADUser.Size = New-Object System.Drawing.Size(120, 32)
+$btnUseSelectedADUser.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnUseSelectedADUser.FlatStyle = 'Flat'
+$grpDeleteAccount.Controls.Add($btnUseSelectedADUser)
+
+$btnDeleteAccount = New-Object System.Windows.Forms.Button
+$btnDeleteAccount.Text = 'Delete From AD'
+$btnDeleteAccount.Location = New-Object System.Drawing.Point(625, 70)
+$btnDeleteAccount.Size = New-Object System.Drawing.Size(150, 32)
+$btnDeleteAccount.BackColor = [System.Drawing.Color]::FromArgb(226, 196, 196)
+$btnDeleteAccount.FlatStyle = 'Flat'
+$grpDeleteAccount.Controls.Add($btnDeleteAccount)
+
+$dgvADUserSearch = New-Object System.Windows.Forms.DataGridView
+$dgvADUserSearch.Location = New-Object System.Drawing.Point(16, 116)
+$dgvADUserSearch.Size = New-Object System.Drawing.Size(980, 170)
+$dgvADUserSearch.AllowUserToAddRows = $false
+$dgvADUserSearch.AllowUserToDeleteRows = $false
+$dgvADUserSearch.ReadOnly = $true
+$dgvADUserSearch.SelectionMode = 'FullRowSelect'
+$dgvADUserSearch.MultiSelect = $false
+$dgvADUserSearch.AutoSizeColumnsMode = 'Fill'
+$dgvADUserSearch.RowHeadersVisible = $false
+$grpDeleteAccount.Controls.Add($dgvADUserSearch)
+
+$tableADUserSearch = New-Object System.Data.DataTable
+[void]$tableADUserSearch.Columns.Add('Username', [string])
+[void]$tableADUserSearch.Columns.Add('Display Name', [string])
+[void]$tableADUserSearch.Columns.Add('Email', [string])
+$dgvADUserSearch.DataSource = $tableADUserSearch
+
+$lblAcctOutput = New-Object System.Windows.Forms.Label
+$lblAcctOutput.Text = 'Account Task Output:'
+$lblAcctOutput.Location = New-Object System.Drawing.Point(20, 570)
+$lblAcctOutput.AutoSize = $true
+$tabAccounts.Controls.Add($lblAcctOutput)
+
+$txtAcctOutput = New-Object System.Windows.Forms.TextBox
+$txtAcctOutput.Location = New-Object System.Drawing.Point(20, 595)
+$txtAcctOutput.Size = New-Object System.Drawing.Size(1015, 90)
+$txtAcctOutput.Multiline = $true
+$txtAcctOutput.ScrollBars = 'Vertical'
+$txtAcctOutput.ReadOnly = $true
+$txtAcctOutput.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 250)
+$tabAccounts.Controls.Add($txtAcctOutput)
+
+# -----------------------------
+# Settings tab
+# -----------------------------
+$tabSettings = New-Object System.Windows.Forms.TabPage
+$tabSettings.Text = 'Settings'
+$tabSettings.BackColor = [System.Drawing.Color]::White
+$tabs.TabPages.Add($tabSettings)
+
+$lblSettingsTitle = New-Object System.Windows.Forms.Label
+$lblSettingsTitle.Text = 'Appearance Settings'
+$lblSettingsTitle.Location = New-Object System.Drawing.Point(20, 20)
+$lblSettingsTitle.AutoSize = $true
+$lblSettingsTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 16)
+$tabSettings.Controls.Add($lblSettingsTitle)
+
+$lblSettingsHint = New-Object System.Windows.Forms.Label
+$lblSettingsHint.Text = 'Pick colors below. Preview updates instantly, then click Apply Theme to use app-wide.'
+$lblSettingsHint.Location = New-Object System.Drawing.Point(22, 52)
+$lblSettingsHint.Size = New-Object System.Drawing.Size(860, 24)
+$lblSettingsHint.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$tabSettings.Controls.Add($lblSettingsHint)
+
+$grpThemeColors = New-Object System.Windows.Forms.GroupBox
+$grpThemeColors.Text = 'Theme Colors'
+$grpThemeColors.Location = New-Object System.Drawing.Point(20, 88)
+$grpThemeColors.Size = New-Object System.Drawing.Size(500, 220)
+$grpThemeColors.Anchor = 'Top, Left'
+$tabSettings.Controls.Add($grpThemeColors)
+
+$lblHeaderTheme = New-Object System.Windows.Forms.Label
+$lblHeaderTheme.Text = 'Header Color'
+$lblHeaderTheme.Location = New-Object System.Drawing.Point(16, 36)
+$lblHeaderTheme.Size = New-Object System.Drawing.Size(140, 22)
+$grpThemeColors.Controls.Add($lblHeaderTheme)
+
+$pnlHeaderPreview = New-Object System.Windows.Forms.Panel
+$pnlHeaderPreview.Location = New-Object System.Drawing.Point(165, 32)
+$pnlHeaderPreview.Size = New-Object System.Drawing.Size(52, 26)
+$pnlHeaderPreview.BorderStyle = 'FixedSingle'
+$pnlHeaderPreview.BackColor = $script:HeaderColor
+$grpThemeColors.Controls.Add($pnlHeaderPreview)
+
+$btnPickHeaderColor = New-Object System.Windows.Forms.Button
+$btnPickHeaderColor.Text = 'Choose Color'
+$btnPickHeaderColor.Location = New-Object System.Drawing.Point(230, 30)
+$btnPickHeaderColor.Size = New-Object System.Drawing.Size(120, 30)
+$btnPickHeaderColor.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnPickHeaderColor.FlatStyle = 'Flat'
+$grpThemeColors.Controls.Add($btnPickHeaderColor)
+
+$lblHeaderRgb = New-Object System.Windows.Forms.Label
+$lblHeaderRgb.Text = ''
+$lblHeaderRgb.Location = New-Object System.Drawing.Point(360, 35)
+$lblHeaderRgb.Size = New-Object System.Drawing.Size(155, 22)
+$lblHeaderRgb.Font = New-Object System.Drawing.Font('Consolas', 9)
+$lblHeaderRgb.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpThemeColors.Controls.Add($lblHeaderRgb)
+
+$lblAccentTheme = New-Object System.Windows.Forms.Label
+$lblAccentTheme.Text = 'Accent Button Color'
+$lblAccentTheme.Location = New-Object System.Drawing.Point(16, 84)
+$lblAccentTheme.Size = New-Object System.Drawing.Size(140, 22)
+$grpThemeColors.Controls.Add($lblAccentTheme)
+
+$pnlAccentPreview = New-Object System.Windows.Forms.Panel
+$pnlAccentPreview.Location = New-Object System.Drawing.Point(165, 80)
+$pnlAccentPreview.Size = New-Object System.Drawing.Size(52, 26)
+$pnlAccentPreview.BorderStyle = 'FixedSingle'
+$pnlAccentPreview.BackColor = $script:AccentColor
+$grpThemeColors.Controls.Add($pnlAccentPreview)
+
+$btnPickAccentColor = New-Object System.Windows.Forms.Button
+$btnPickAccentColor.Text = 'Choose Color'
+$btnPickAccentColor.Location = New-Object System.Drawing.Point(230, 78)
+$btnPickAccentColor.Size = New-Object System.Drawing.Size(120, 30)
+$btnPickAccentColor.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnPickAccentColor.FlatStyle = 'Flat'
+$grpThemeColors.Controls.Add($btnPickAccentColor)
+
+$lblAccentRgb = New-Object System.Windows.Forms.Label
+$lblAccentRgb.Text = ''
+$lblAccentRgb.Location = New-Object System.Drawing.Point(360, 83)
+$lblAccentRgb.Size = New-Object System.Drawing.Size(155, 22)
+$lblAccentRgb.Font = New-Object System.Drawing.Font('Consolas', 9)
+$lblAccentRgb.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpThemeColors.Controls.Add($lblAccentRgb)
+
+$lblThemeNote = New-Object System.Windows.Forms.Label
+$lblThemeNote.Text = 'Tip: Accent color updates primary action buttons across tabs.'
+$lblThemeNote.Location = New-Object System.Drawing.Point(16, 126)
+$lblThemeNote.Size = New-Object System.Drawing.Size(450, 22)
+$lblThemeNote.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpThemeColors.Controls.Add($lblThemeNote)
+
+$chkDarkMode = New-Object System.Windows.Forms.CheckBox
+$chkDarkMode.Text = 'Enable Dark Mode (entire app)'
+$chkDarkMode.Location = New-Object System.Drawing.Point(16, 148)
+$chkDarkMode.Size = New-Object System.Drawing.Size(260, 22)
+$grpThemeColors.Controls.Add($chkDarkMode)
+
+$btnApplyTheme = New-Object System.Windows.Forms.Button
+$btnApplyTheme.Text = 'Apply Theme'
+$btnApplyTheme.Location = New-Object System.Drawing.Point(16, 170)
+$btnApplyTheme.Size = New-Object System.Drawing.Size(150, 34)
+$btnApplyTheme.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnApplyTheme.FlatStyle = 'Flat'
+$grpThemeColors.Controls.Add($btnApplyTheme)
+
+$btnResetTheme = New-Object System.Windows.Forms.Button
+$btnResetTheme.Text = 'Reset Defaults'
+$btnResetTheme.Location = New-Object System.Drawing.Point(176, 170)
+$btnResetTheme.Size = New-Object System.Drawing.Size(150, 34)
+$btnResetTheme.BackColor = [System.Drawing.Color]::FromArgb(226, 196, 196)
+$btnResetTheme.FlatStyle = 'Flat'
+$grpThemeColors.Controls.Add($btnResetTheme)
+
+$grpThemePreview = New-Object System.Windows.Forms.GroupBox
+$grpThemePreview.Text = 'Live Preview'
+$grpThemePreview.Location = New-Object System.Drawing.Point(535, 88)
+$grpThemePreview.Size = New-Object System.Drawing.Size(500, 220)
+$grpThemePreview.Anchor = 'Top, Left'
+$tabSettings.Controls.Add($grpThemePreview)
+
+$pnlThemePreviewHeader = New-Object System.Windows.Forms.Panel
+$pnlThemePreviewHeader.Location = New-Object System.Drawing.Point(16, 30)
+$pnlThemePreviewHeader.Size = New-Object System.Drawing.Size(468, 38)
+$pnlThemePreviewHeader.BackColor = $script:HeaderColor
+$grpThemePreview.Controls.Add($pnlThemePreviewHeader)
+
+$lblThemePreviewHeader = New-Object System.Windows.Forms.Label
+$lblThemePreviewHeader.Text = 'Header Preview'
+$lblThemePreviewHeader.ForeColor = [System.Drawing.Color]::White
+$lblThemePreviewHeader.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+$lblThemePreviewHeader.Location = New-Object System.Drawing.Point(12, 8)
+$lblThemePreviewHeader.AutoSize = $true
+$pnlThemePreviewHeader.Controls.Add($lblThemePreviewHeader)
+
+$btnThemePreviewPrimary = New-Object System.Windows.Forms.Button
+$btnThemePreviewPrimary.Text = 'Primary Action'
+$btnThemePreviewPrimary.Location = New-Object System.Drawing.Point(16, 88)
+$btnThemePreviewPrimary.Size = New-Object System.Drawing.Size(140, 34)
+$btnThemePreviewPrimary.BackColor = $script:AccentColor
+$btnThemePreviewPrimary.FlatStyle = 'Flat'
+$grpThemePreview.Controls.Add($btnThemePreviewPrimary)
+
+$btnThemePreviewSecondary = New-Object System.Windows.Forms.Button
+$btnThemePreviewSecondary.Text = 'Secondary Action'
+$btnThemePreviewSecondary.Location = New-Object System.Drawing.Point(168, 88)
+$btnThemePreviewSecondary.Size = New-Object System.Drawing.Size(150, 34)
+$btnThemePreviewSecondary.BackColor = $script:AccentColor
+$btnThemePreviewSecondary.FlatStyle = 'Flat'
+$grpThemePreview.Controls.Add($btnThemePreviewSecondary)
+
+$lblThemePreviewInfo = New-Object System.Windows.Forms.Label
+$lblThemePreviewInfo.Text = 'Use Apply Theme to push these colors to the full app.'
+$lblThemePreviewInfo.Location = New-Object System.Drawing.Point(16, 170)
+$lblThemePreviewInfo.Size = New-Object System.Drawing.Size(420, 24)
+$lblThemePreviewInfo.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpThemePreview.Controls.Add($lblThemePreviewInfo)
+
+$grpTabLayout = New-Object System.Windows.Forms.GroupBox
+$grpTabLayout.Text = 'Tab Order (Per User)'
+$grpTabLayout.Location = New-Object System.Drawing.Point(20, 318)
+$grpTabLayout.Size = New-Object System.Drawing.Size(1015, 230)
+$grpTabLayout.Anchor = 'Top, Left, Right'
+$tabSettings.Controls.Add($grpTabLayout)
+
+$lblTabLayoutHint = New-Object System.Windows.Forms.Label
+$lblTabLayoutHint.Text = 'Move tabs up/down, then click Save Tab Order. This is saved for your Windows profile.'
+$lblTabLayoutHint.Location = New-Object System.Drawing.Point(16, 28)
+$lblTabLayoutHint.Size = New-Object System.Drawing.Size(700, 22)
+$lblTabLayoutHint.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+$grpTabLayout.Controls.Add($lblTabLayoutHint)
+
+$lstTabOrder = New-Object System.Windows.Forms.ListBox
+$lstTabOrder.Location = New-Object System.Drawing.Point(16, 58)
+$lstTabOrder.Size = New-Object System.Drawing.Size(360, 150)
+$grpTabLayout.Controls.Add($lstTabOrder)
+
+$btnTabUp = New-Object System.Windows.Forms.Button
+$btnTabUp.Text = 'Move Up'
+$btnTabUp.Location = New-Object System.Drawing.Point(392, 58)
+$btnTabUp.Size = New-Object System.Drawing.Size(110, 32)
+$btnTabUp.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnTabUp.FlatStyle = 'Flat'
+$grpTabLayout.Controls.Add($btnTabUp)
+
+$btnTabDown = New-Object System.Windows.Forms.Button
+$btnTabDown.Text = 'Move Down'
+$btnTabDown.Location = New-Object System.Drawing.Point(392, 98)
+$btnTabDown.Size = New-Object System.Drawing.Size(110, 32)
+$btnTabDown.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnTabDown.FlatStyle = 'Flat'
+$grpTabLayout.Controls.Add($btnTabDown)
+
+$btnSaveTabOrder = New-Object System.Windows.Forms.Button
+$btnSaveTabOrder.Text = 'Save Tab Order'
+$btnSaveTabOrder.Location = New-Object System.Drawing.Point(392, 148)
+$btnSaveTabOrder.Size = New-Object System.Drawing.Size(130, 32)
+$btnSaveTabOrder.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnSaveTabOrder.FlatStyle = 'Flat'
+$grpTabLayout.Controls.Add($btnSaveTabOrder)
+
+$lblProfileName = New-Object System.Windows.Forms.Label
+$lblProfileName.Text = 'Profile:'
+$lblProfileName.Location = New-Object System.Drawing.Point(560, 62)
+$lblProfileName.Size = New-Object System.Drawing.Size(55, 22)
+$grpTabLayout.Controls.Add($lblProfileName)
+
+$cmbSettingsProfile = New-Object System.Windows.Forms.ComboBox
+$cmbSettingsProfile.Location = New-Object System.Drawing.Point(620, 58)
+$cmbSettingsProfile.Size = New-Object System.Drawing.Size(220, 30)
+$cmbSettingsProfile.DropDownStyle = 'DropDownList'
+$grpTabLayout.Controls.Add($cmbSettingsProfile)
+
+$btnLoadProfile = New-Object System.Windows.Forms.Button
+$btnLoadProfile.Text = 'Load Profile'
+$btnLoadProfile.Location = New-Object System.Drawing.Point(850, 58)
+$btnLoadProfile.Size = New-Object System.Drawing.Size(140, 32)
+$btnLoadProfile.BackColor = [System.Drawing.Color]::FromArgb(199, 221, 240)
+$btnLoadProfile.FlatStyle = 'Flat'
+$grpTabLayout.Controls.Add($btnLoadProfile)
+
+$btnSaveAsProfile = New-Object System.Windows.Forms.Button
+$btnSaveAsProfile.Text = 'Save As Profile...'
+$btnSaveAsProfile.Location = New-Object System.Drawing.Point(560, 100)
+$btnSaveAsProfile.Size = New-Object System.Drawing.Size(160, 32)
+$btnSaveAsProfile.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+$btnSaveAsProfile.FlatStyle = 'Flat'
+$grpTabLayout.Controls.Add($btnSaveAsProfile)
+
+# -----------------------------
+# Bottom log area
+# -----------------------------
+$grpLog = New-Object System.Windows.Forms.GroupBox
+$grpLog.Text = 'Activity Log'
+$grpLog.Location = New-Object System.Drawing.Point(15, 740)
+$grpLog.Size = New-Object System.Drawing.Size(1075, 115)
+$grpLog.Anchor = 'Bottom, Left, Right'
+$form.Controls.Add($grpLog)
+
+$script:txtLog = New-Object System.Windows.Forms.TextBox
+$script:txtLog.Location = New-Object System.Drawing.Point(10, 22)
+$script:txtLog.Size = New-Object System.Drawing.Size(1055, 80)
+$script:txtLog.Multiline = $true
+$script:txtLog.ScrollBars = 'Vertical'
+$script:txtLog.ReadOnly = $true
+$script:txtLog.BackColor = [System.Drawing.Color]::White
+$script:txtLog.Font = New-Object System.Drawing.Font('Consolas', 9)
+$script:txtLog.Anchor = 'Top, Bottom, Left, Right'
+$grpLog.Controls.Add($script:txtLog)
+
+# -----------------------------
+# Shared event helpers
+# -----------------------------
+function Invoke-PingButton {
+    param([string]$ComputerName)
+
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    Write-Log "Pinging $ComputerName..."
+    if (Test-HostPing -ComputerName $ComputerName) {
+        Show-Info "$ComputerName responded to ping."
+        Write-Log "$ComputerName responded to ping." -Level Success
+    }
+    else {
+        Show-Error "$ComputerName did not respond to ping."
+        Write-Log "$ComputerName did not respond to ping." -Level Error
+    }
+}
+
+function Invoke-GeneralAction {
+    param(
+        [string]$ComputerName,
+        [string]$Action,
+        [System.Windows.Forms.TextBox]$OutputBox
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ComputerName)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    try {
+        Write-Log "Running $Action on $ComputerName..."
+        if (-not (Test-RemoteAccess -ComputerName $ComputerName -Credential $script:AdminCredential)) {
+            return
+        }
+
+        $result = Invoke-GeneralRemoteCommand -ComputerName $ComputerName -Credential $script:AdminCredential -Action $Action
+        $OutputBox.Text = [string]$result
+        Write-Log "$Action completed on $ComputerName." -Level Success
+    }
+    catch {
+        Show-Error "$Action failed for $ComputerName.`r`n$($_.Exception.Message)"
+    }
+}
+
+function Invoke-GeneralWindowsUpdateAction {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Check','Install')] [string]$Mode,
+        [Parameter(Mandatory)] [System.Windows.Forms.TextBox]$OutputBox
+    )
+
+    $inputValue = $txtGComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($inputValue)) {
+        Show-Error "Enter a computer name, comma-separated computer names, or a .txt file path."
+        return
+    }
+
+    $raw = $inputValue
+    $file = ''
+    if (($inputValue -like '*.txt') -and (Test-Path -Path $inputValue)) {
+        $raw = ''
+        $file = $inputValue
+    }
+
+    try {
+        $targets = Get-ComputerTargetsFromInput -RawComputerInput $raw -FilePathInput $file
+    }
+    catch {
+        Show-Error $_.Exception.Message
+        return
+    }
+
+    if (-not $targets -or $targets.Count -eq 0) {
+        Show-Error "No valid targets were found in the Computer Name field."
+        return
+    }
+
+    if ($Mode -eq 'Install') {
+        $confirm = Show-YesNo "Install pending Windows updates on $($targets.Count) computer(s)?"
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+            Write-Log 'Windows update install canceled by user.' -Level Warn
+            return
+        }
+    }
+
+    $actionLabel = if ($Mode -eq 'Check') { 'check' } else { 'install' }
+    $OutputBox.Clear()
+    $OutputBox.AppendText("Windows Update $actionLabel run started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n")
+    $OutputBox.AppendText("Targets: $($targets -join ', ')`r`n`r`n")
+    Write-Log "Starting Windows Update $actionLabel on $($targets.Count) target(s)..."
+
+    $success = 0
+    $fail = 0
+    $rebootNeeded = 0
+
+    foreach ($computer in $targets) {
+        $OutputBox.AppendText("[$computer] --------------------------------`r`n")
+        try {
+            if (-not (Test-HostPing -ComputerName $computer)) {
+                $OutputBox.AppendText("Ping failed. Skipping.`r`n`r`n")
+                Write-Log "Windows Update $actionLabel skipped for $computer (ping failed)." -Level Error
+                $fail++
+                continue
+            }
+
+            if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+                $OutputBox.AppendText("Remote access failed. Skipping.`r`n`r`n")
+                $fail++
+                continue
+            }
+
+            Write-Log "Running Windows Update $actionLabel on $computer..."
+            $result = Invoke-RemoteWindowsUpdate -ComputerName $computer -Credential $script:AdminCredential -Mode $Mode
+            $resultCodeMeaning = Get-WindowsUpdateResultCodeMeaning -ResultCode $result.ResultCode
+
+            $OutputBox.AppendText("Pending updates found: $($result.PendingCount)`r`n")
+            if ($Mode -eq 'Install') {
+                $OutputBox.AppendText("Installed updates: $($result.InstalledCount)`r`n")
+            }
+            $OutputBox.AppendText("Result code: $($result.ResultCode) = $resultCodeMeaning`r`n")
+            $OutputBox.AppendText("Reboot required: $($result.RebootRequired)`r`n")
+
+            if ($result.UpdateTitles -and $result.UpdateTitles.Count -gt 0) {
+                $OutputBox.AppendText("Updates:`r`n")
+                foreach ($title in $result.UpdateTitles) {
+                    $OutputBox.AppendText(" - $title`r`n")
+                }
+            }
+            else {
+                $OutputBox.AppendText("Updates: none detected.`r`n")
+            }
+            $OutputBox.AppendText("`r`n")
+
+            if ([bool]$result.RebootRequired) { $rebootNeeded++ }
+            Write-Log "Windows Update $actionLabel completed on $computer. Pending: $($result.PendingCount), RebootRequired: $($result.RebootRequired)" -Level Success
+            $success++
+        }
+        catch {
+            $OutputBox.AppendText("$actionLabel failed: $($_.Exception.Message)`r`n`r`n")
+            Write-Log "Windows Update $actionLabel failed on ${computer}: $($_.Exception.Message)" -Level Error
+            $fail++
+        }
+    }
+
+    $summary = "Windows Update $actionLabel complete. Success: $success, Failed: $fail, Reboot required: $rebootNeeded"
+    $OutputBox.AppendText($summary + "`r`n")
+    Write-Log $summary
+    Show-Info $summary
+}
+
+function Update-PopupTargetCountLabel {
+    param(
+        [string]$RawComputerInput,
+        [string]$FilePathInput,
+        [System.Windows.Forms.Label]$TargetLabel
+    )
+
+    if (-not $TargetLabel) { return }
+
+    try {
+        $targets = Get-ComputerTargetsFromInput -RawComputerInput $RawComputerInput -FilePathInput $FilePathInput
+        $TargetLabel.Text = "Targets detected: $($targets.Count)"
+        $TargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
+    }
+    catch {
+        $TargetLabel.Text = 'Targets detected: invalid file path'
+        $TargetLabel.ForeColor = [System.Drawing.Color]::FromArgb(175, 75, 75)
+    }
+}
+
+function Update-ThemePreview {
+    $pnlHeaderPreview.BackColor = $script:HeaderColor
+    $pnlAccentPreview.BackColor = $script:AccentColor
+    $pnlThemePreviewHeader.BackColor = $script:HeaderColor
+    $btnThemePreviewPrimary.BackColor = $script:AccentColor
+    $btnThemePreviewSecondary.BackColor = $script:AccentColor
+    $lblHeaderRgb.Text = "RGB: $($script:HeaderColor.R),$($script:HeaderColor.G),$($script:HeaderColor.B)"
+    $lblAccentRgb.Text = "RGB: $($script:AccentColor.R),$($script:AccentColor.G),$($script:AccentColor.B)"
+}
+
+function Set-VisualModeForControl {
+    param([System.Windows.Forms.Control]$Control)
+
+    if (-not $Control) { return }
+    if ($script:tabSecret -and ($Control -eq $script:tabSecret -or $script:tabSecret.Contains($Control))) { return }
+
+    $darkBack = [System.Drawing.Color]::FromArgb(34, 38, 46)
+    $darkSurface = [System.Drawing.Color]::FromArgb(45, 50, 60)
+    $darkInput = [System.Drawing.Color]::FromArgb(27, 31, 38)
+    $darkFore = [System.Drawing.Color]::FromArgb(235, 239, 246)
+    $lightBack = [System.Drawing.Color]::White
+    $lightInput = [System.Drawing.Color]::FromArgb(246, 248, 250)
+    $lightFore = [System.Drawing.Color]::Black
+
+    if ($Control -is [System.Windows.Forms.TabControl] -or $Control -is [System.Windows.Forms.Button]) {
+        return
+    }
+
+    if ($Control -is [System.Windows.Forms.TextBox]) {
+        $Control.BackColor = if ($script:IsDarkMode) { $darkInput } else { $lightInput }
+        $Control.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+    }
+    elseif ($Control -is [System.Windows.Forms.ComboBox] -or $Control -is [System.Windows.Forms.ListBox]) {
+        $Control.BackColor = if ($script:IsDarkMode) { $darkInput } else { [System.Drawing.Color]::White }
+        $Control.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+    }
+    elseif ($Control -is [System.Windows.Forms.DataGridView]) {
+        $Control.BackgroundColor = if ($script:IsDarkMode) { $darkSurface } else { [System.Drawing.Color]::White }
+        $Control.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+        $Control.DefaultCellStyle.BackColor = if ($script:IsDarkMode) { [System.Drawing.Color]::FromArgb(40, 45, 54) } else { [System.Drawing.Color]::White }
+        $Control.DefaultCellStyle.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+        $Control.ColumnHeadersDefaultCellStyle.BackColor = if ($script:IsDarkMode) { [System.Drawing.Color]::FromArgb(58, 64, 76) } else { [System.Drawing.Color]::FromArgb(240, 240, 240) }
+        $Control.ColumnHeadersDefaultCellStyle.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+        $Control.EnableHeadersVisualStyles = $false
+    }
+    else {
+        if ($Control -is [System.Windows.Forms.TabPage]) {
+            $Control.BackColor = if ($script:IsDarkMode) { $darkBack } else { $lightBack }
+        }
+        elseif ($Control -is [System.Windows.Forms.GroupBox] -or $Control -is [System.Windows.Forms.Panel]) {
+            $Control.BackColor = if ($script:IsDarkMode) { $darkSurface } else { $lightBack }
+        }
+        elseif (-not ($Control -eq $form -or $Control -eq $headerPanel)) {
+            $Control.BackColor = if ($script:IsDarkMode) { $darkBack } else { $lightBack }
+        }
+
+        if ($Control -is [System.Windows.Forms.Label] -or $Control -is [System.Windows.Forms.GroupBox]) {
+            $Control.ForeColor = if ($script:IsDarkMode) { $darkFore } else { $lightFore }
+        }
+    }
+
+    foreach ($child in $Control.Controls) {
+        Set-VisualModeForControl -Control $child
+    }
+}
+
+function Get-ReadableTextColor {
+    param([System.Drawing.Color]$BackgroundColor)
+    $luma = (0.299 * $BackgroundColor.R) + (0.587 * $BackgroundColor.G) + (0.114 * $BackgroundColor.B)
+    if ($luma -lt 145) {
+        return [System.Drawing.Color]::White
+    }
+    return [System.Drawing.Color]::FromArgb(25, 25, 25)
+}
+
+function Refresh-TabOrderList {
+    $lstTabOrder.Items.Clear()
+    foreach ($page in $tabs.TabPages) {
+        [void]$lstTabOrder.Items.Add($page.Text)
+    }
+}
+
+function Apply-TabOrderFromList {
+    $orderedNames = @($lstTabOrder.Items | ForEach-Object { [string]$_ })
+    if (-not $orderedNames -or $orderedNames.Count -eq 0) { return }
+
+    $lookup = @{}
+    foreach ($page in $tabs.TabPages) {
+        $lookup[$page.Text] = $page
+    }
+
+    $tabs.TabPages.Clear()
+    foreach ($name in $orderedNames) {
+        if ($lookup.ContainsKey($name)) {
+            [void]$tabs.TabPages.Add($lookup[$name])
+        }
+    }
+}
+
+function Apply-SavedTabOrder {
+    param($SavedTabOrder)
+
+    if (-not $SavedTabOrder) { return }
+    $orderedNames = @($SavedTabOrder | ForEach-Object { [string]$_ })
+    if ($orderedNames.Count -eq 0) { return }
+
+    $lookup = @{}
+    foreach ($page in $tabs.TabPages) {
+        $lookup[$page.Text] = $page
+    }
+
+    $tabs.TabPages.Clear()
+    foreach ($name in $orderedNames) {
+        if ($lookup.ContainsKey($name)) {
+            [void]$tabs.TabPages.Add($lookup[$name])
+            $null = $lookup.Remove($name)
+        }
+    }
+
+    foreach ($remaining in $lookup.Values) {
+        [void]$tabs.TabPages.Add($remaining)
+    }
+}
+
+function Refresh-SettingsProfileDropdown {
+    $current = if ($cmbSettingsProfile.SelectedItem) { [string]$cmbSettingsProfile.SelectedItem } else { '' }
+    $names = Get-ProfileNames
+    $cmbSettingsProfile.Items.Clear()
+    foreach ($name in $names) {
+        [void]$cmbSettingsProfile.Items.Add($name)
+    }
+
+    if ($current -and $cmbSettingsProfile.Items.Contains($current)) {
+        $cmbSettingsProfile.SelectedItem = $current
+    }
+    elseif ($cmbSettingsProfile.Items.Contains('Default')) {
+        $cmbSettingsProfile.SelectedItem = 'Default'
+    }
+    elseif ($cmbSettingsProfile.Items.Count -gt 0) {
+        $cmbSettingsProfile.SelectedIndex = 0
+    }
+}
+
+function Get-SelectedSettingsProfileName {
+    if ($cmbSettingsProfile -and $cmbSettingsProfile.SelectedItem) {
+        return [string]$cmbSettingsProfile.SelectedItem
+    }
+    return 'Default'
+}
+
+function Save-CurrentProfileSettings {
+    if (-not $tabs) { return }
+    $profileName = Get-SelectedSettingsProfileName
+    Save-UserSettings -TabControl $tabs -ProfileName $profileName
+}
+
+function Apply-SettingsProfile {
+    param([string]$ProfileName)
+
+    $script:IsApplyingSettingsProfile = $true
+    $safeProfile = Get-SafeProfileName -ProfileName $ProfileName
+    $script:HeaderColor = $script:DefaultHeaderColor
+    $script:AccentColor = $script:DefaultAccentColor
+    $script:IsDarkMode = $false
+
+    $settings = Get-UserSettings -ProfileName $safeProfile
+    if ($settings) {
+        try {
+            if ($settings.HeaderColor) {
+                $script:HeaderColor = [System.Drawing.Color]::FromArgb(
+                    [int]$settings.HeaderColor.R,
+                    [int]$settings.HeaderColor.G,
+                    [int]$settings.HeaderColor.B
+                )
+            }
+            if ($settings.AccentColor) {
+                $script:AccentColor = [System.Drawing.Color]::FromArgb(
+                    [int]$settings.AccentColor.R,
+                    [int]$settings.AccentColor.G,
+                    [int]$settings.AccentColor.B
+                )
+            }
+            if ($settings.PSObject.Properties.Name -contains 'DarkMode') {
+                $script:IsDarkMode = [bool]$settings.DarkMode
+            }
+            if ($settings.TabOrder) {
+                Apply-SavedTabOrder -SavedTabOrder $settings.TabOrder
+            }
+            Import-CookieClickerSaveState -SavedState $settings.CookieClicker
+        }
+        catch {
+            Write-Log "Unable to apply profile $safeProfile. Using defaults. $($_.Exception.Message)" -Level Warn
+        }
+    }
+    else {
+        Import-CookieClickerSaveState -SavedState $null
+    }
+
+    Set-ActiveProfileName -ProfileName $safeProfile
+    if ($chkDarkMode) {
+        $chkDarkMode.Checked = $script:IsDarkMode
+    }
+    Update-ThemePreview
+    Apply-AppTheme
+    Refresh-TabOrderList
+    $script:IsApplyingSettingsProfile = $false
+}
+
+function Apply-AppTheme {
+    $headerPanel.BackColor = $script:HeaderColor
+    $form.BackColor = if ($script:IsDarkMode) { [System.Drawing.Color]::FromArgb(28, 32, 40) } else { [System.Drawing.Color]::FromArgb(236, 245, 244) }
+
+    foreach ($page in $tabs.TabPages) {
+        if ($script:tabSecret -and $page -eq $script:tabSecret) { continue }
+        Set-VisualModeForControl -Control $page
+    }
+
+    if ($grpLog) {
+        Set-VisualModeForControl -Control $grpLog
+    }
+
+    $accentButtons = @(
+        $btnSPing, $btnSLoad, $btnBrowseCompFile, $btnSendPopup,
+        $btnGPing, $btnGPUpdate, $btnIPConfig, $btnFlushDNS, $btnReleaseRenew,
+        $btnDeletePing, $btnLoadProfiles, $btnDeleteProfiles,
+        $btnBLPing, $btnEnableBL, $btnBLLookup, $btnCreateAccount,
+        $btnSearchADUsers, $btnUseSelectedADUser,
+        $btnPickHeaderColor, $btnPickAccentColor, $btnApplyTheme
+    ) | Where-Object { $_ }
+
+    foreach ($button in $accentButtons) {
+        $button.BackColor = $script:AccentColor
+        $button.ForeColor = Get-ReadableTextColor -BackgroundColor $script:AccentColor
+    }
+
+    # Keep Windows Update actions visually distinct from general network actions.
+    if ($btnGWindowsUpdateCheck) {
+        $btnGWindowsUpdateCheck.BackColor = [System.Drawing.Color]::FromArgb(245, 223, 168)
+        $btnGWindowsUpdateCheck.ForeColor = Get-ReadableTextColor -BackgroundColor $btnGWindowsUpdateCheck.BackColor
+    }
+    if ($btnGWindowsUpdate) {
+        $btnGWindowsUpdate.BackColor = [System.Drawing.Color]::FromArgb(176, 215, 207)
+        $btnGWindowsUpdate.ForeColor = Get-ReadableTextColor -BackgroundColor $btnGWindowsUpdate.BackColor
+    }
+    if ($btnShutdown) {
+        $btnShutdown.ForeColor = Get-ReadableTextColor -BackgroundColor $btnShutdown.BackColor
+    }
+    if ($btnDeleteProfiles) {
+        $btnDeleteProfiles.ForeColor = Get-ReadableTextColor -BackgroundColor $btnDeleteProfiles.BackColor
+    }
+    if ($btnDeleteAccount) {
+        $btnDeleteAccount.ForeColor = Get-ReadableTextColor -BackgroundColor $btnDeleteAccount.BackColor
+    }
+    if ($btnBLReboot) {
+        $btnBLReboot.ForeColor = Get-ReadableTextColor -BackgroundColor $btnBLReboot.BackColor
+    }
+    if ($btnResetTheme) {
+        $btnResetTheme.ForeColor = Get-ReadableTextColor -BackgroundColor $btnResetTheme.BackColor
+    }
+    if ($btnSaveAsProfile) {
+        $btnSaveAsProfile.ForeColor = Get-ReadableTextColor -BackgroundColor $btnSaveAsProfile.BackColor
+    }
+    if ($btnSaveTabOrder) {
+        $btnSaveTabOrder.ForeColor = Get-ReadableTextColor -BackgroundColor $btnSaveTabOrder.BackColor
+    }
+    if ($btnLoadProfile) {
+        $btnLoadProfile.ForeColor = Get-ReadableTextColor -BackgroundColor $btnLoadProfile.BackColor
+    }
+
+    $mutedLabels = @(
+        $lblSettingsHint, $lblThemeNote, $lblThemePreviewInfo, $lblTabLayoutHint,
+        $lblPopupHint, $lblPopupTargetCount, $lblAcctPreview, $lblWelcome2,
+        $lblHeaderRgb, $lblAccentRgb
+    ) | Where-Object { $_ }
+    foreach ($label in $mutedLabels) {
+        $label.ForeColor = if ($script:IsDarkMode) { [System.Drawing.Color]::FromArgb(190, 196, 210) } else { [System.Drawing.Color]::FromArgb(90, 90, 90) }
+    }
+}
+
+# -----------------------------
+# Events - System Info / Popup
+# -----------------------------
+$btnSPing.Add_Click({ Invoke-PingButton -ComputerName $txtSComputer.Text.Trim() })
+
+$btnSLoad.Add_Click({
+    $computer = $txtSComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $tableSystemInfo.Rows.Clear()
+    Write-Log "Loading system info from $computer..."
+
+    try {
+        if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+            return
+        }
+
+        $info = Get-RemoteSystemInfo -ComputerName $computer -Credential $script:AdminCredential
+
+        $items = [ordered]@{
+            'Computer Name' = [string]$info.ComputerName
+            'Logged In User' = [string]$info.LoggedInUser
+            'Model' = [string]$info.Model
+            'Serial Number' = [string]$info.SerialNumber
+            'OS Version' = [string]$info.OSVersion
+            'Build Number' = [string]$info.BuildNumber
+            'Last Boot' = if ($info.LastBoot) { (Get-Date $info.LastBoot -Format 'yyyy-MM-dd HH:mm:ss') } else { '' }
+            'Uptime' = if ($info.LastBoot) { Format-Uptime -LastBoot ([datetime]$info.LastBoot) } else { '' }
+            'IP Address' = [string]$info.IPAddress
+            'C: Free Space (GB)' = [string]$info.FreeSpaceGB
+            'C: Total Space (GB)' = [string]$info.TotalSpaceGB
+            'BitLocker Status' = [string]$info.BitLocker
+        }
+
+        foreach ($key in $items.Keys) {
+            $row = $tableSystemInfo.NewRow()
+            $row['Property'] = $key
+            $row['Value'] = [string]$items[$key]
+            [void]$tableSystemInfo.Rows.Add($row)
+        }
+
+        Write-Log "Loaded system info from $computer." -Level Success
+    }
+    catch {
+        Show-Error "Failed to load system info from $computer.`r`n$($_.Exception.Message)"
+    }
+})
+
+$btnBrowseCompFile.Add_Click({
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = "Text Files (*.txt)|*.txt|All Files (*.*)|*.*"
+    $dialog.Title = "Select a text file with computer names"
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtCompFilePath.Text = $dialog.FileName
+        # Load file content into computers box too (for user visibility/edits)
+        try {
+            $fileList = Get-Content -Path $dialog.FileName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            $txtPopupComputers.Text = ($fileList -join [Environment]::NewLine)
+            Update-PopupTargetCountLabel -RawComputerInput $txtPopupComputers.Text -FilePathInput $txtCompFilePath.Text.Trim() -TargetLabel $lblPopupTargetCount
+            Write-Log "Loaded computer list from $($dialog.FileName)." -Level Success
+        }
+        catch {
+            Show-Error "Failed to read file: $($dialog.FileName).`r`n$($_.Exception.Message)"
+        }
+    }
+})
+
+$btnSendPopup.Add_Click({
+    $raw = $txtPopupComputers.Text
+    $file = $txtCompFilePath.Text.Trim()
+    $computers = @()
+
+    try {
+        $computers = Get-ComputerTargetsFromInput -RawComputerInput $raw -FilePathInput $file
+    }
+    catch {
+        Show-Error $_.Exception.Message
+        return
+    }
+
+    if (-not $computers -or $computers.Count -eq 0) {
+        Show-Error "Enter at least one computer name or provide a valid .txt file path."
+        return
+    }
+
+    $msg = $txtPopupMsg.Text
+    if ([string]::IsNullOrWhiteSpace($msg)) {
+        Show-Error "Enter a popup message to send."
+        return
+    }
+    $yesno = Show-YesNo "Send this popup to $($computers.Count) computer(s)?"
+    if ($yesno -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log "Send popup cancelled by user." -Level Warn
+        return
+    }
+
+    Write-Log "Sending popup to $($computers.Count) targets..."
+    $sent = 0
+    $fail = 0
+
+    foreach ($comp in $computers) {
+        if (Test-HostPing -ComputerName $comp) {
+            $success = Invoke-RemotePopup -ComputerName $comp -Credential $script:AdminCredential -Message $msg
+            if ($success) {
+                Write-Log "Popup sent to $comp." -Level Success
+                $sent++
+            }
+            else {
+                Write-Log "Popup failed to $comp." -Level Error
+                $fail++
+            }
+        } else {
+            Write-Log "Ping failed for $comp. Skipping." -Level Error
+            $fail++
+        }
+    }
+
+    $resultMsg = "Popups sent: $sent`nFailed: $fail"
+    Show-Info $resultMsg
+    Write-Log $resultMsg
+})
+
+$txtPopupComputers.Add_TextChanged({
+    Update-PopupTargetCountLabel -RawComputerInput $txtPopupComputers.Text -FilePathInput $txtCompFilePath.Text.Trim() -TargetLabel $lblPopupTargetCount
+})
+
+$txtCompFilePath.Add_TextChanged({
+    Update-PopupTargetCountLabel -RawComputerInput $txtPopupComputers.Text -FilePathInput $txtCompFilePath.Text.Trim() -TargetLabel $lblPopupTargetCount
+})
+
+# -----------------------------
+# Events - Settings
+# -----------------------------
+$btnPickHeaderColor.Add_Click({
+    $dialog = New-Object System.Windows.Forms.ColorDialog
+    $dialog.Color = $script:HeaderColor
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:HeaderColor = $dialog.Color
+        Update-ThemePreview
+    }
+})
+
+$btnPickAccentColor.Add_Click({
+    $dialog = New-Object System.Windows.Forms.ColorDialog
+    $dialog.Color = $script:AccentColor
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $script:AccentColor = $dialog.Color
+        Update-ThemePreview
+    }
+})
+
+$chkDarkMode.Add_CheckedChanged({
+    if ($script:IsApplyingSettingsProfile) { return }
+    $script:IsDarkMode = [bool]$chkDarkMode.Checked
+    Apply-AppTheme
+    Save-CurrentProfileSettings
+    $modeText = if ($script:IsDarkMode) { 'enabled' } else { 'disabled' }
+    Write-Log "Dark mode $modeText for profile '$(Get-SelectedSettingsProfileName)'." -Level Info
+})
+
+$btnApplyTheme.Add_Click({
+    Apply-AppTheme
+    $selectedProfile = Get-SelectedSettingsProfileName
+    Save-CurrentProfileSettings
+    Write-Log "Custom theme applied to profile '$selectedProfile'." -Level Success
+
+    $script:ApplyThemeClickCount++
+    if ((-not $script:SecretUnlocked) -and ($script:ApplyThemeClickCount -ge 7)) {
+        $secretTab = Initialize-SecretTab -TabControl $tabs
+        $tabs.SelectedTab = $secretTab
+        $script:SecretUnlocked = $true
+        Save-CurrentProfileSettings
+        Write-Log "Easter egg unlocked: Joe's Cookie Clicker is now available." -Level Success
+        Show-Info "Secret tab unlocked! Joe's Cookie Clicker is live."
+    }
+})
+
+$btnResetTheme.Add_Click({
+    $script:HeaderColor = $script:DefaultHeaderColor
+    $script:AccentColor = $script:DefaultAccentColor
+    Update-ThemePreview
+    Apply-AppTheme
+    $selectedProfile = Get-SelectedSettingsProfileName
+    Save-CurrentProfileSettings
+    Write-Log "Theme reset to default colors for profile '$selectedProfile'." -Level Info
+})
+
+$btnTabUp.Add_Click({
+    $idx = $lstTabOrder.SelectedIndex
+    if ($idx -le 0) { return }
+
+    $item = $lstTabOrder.Items[$idx]
+    $lstTabOrder.Items.RemoveAt($idx)
+    $lstTabOrder.Items.Insert($idx - 1, $item)
+    $lstTabOrder.SelectedIndex = $idx - 1
+})
+
+$btnTabDown.Add_Click({
+    $idx = $lstTabOrder.SelectedIndex
+    if ($idx -lt 0 -or $idx -ge ($lstTabOrder.Items.Count - 1)) { return }
+
+    $item = $lstTabOrder.Items[$idx]
+    $lstTabOrder.Items.RemoveAt($idx)
+    $lstTabOrder.Items.Insert($idx + 1, $item)
+    $lstTabOrder.SelectedIndex = $idx + 1
+})
+
+$btnSaveTabOrder.Add_Click({
+    Apply-TabOrderFromList
+    $selectedProfile = Get-SelectedSettingsProfileName
+    Save-CurrentProfileSettings
+    Refresh-TabOrderList
+    Write-Log "Tab order saved for profile '$selectedProfile'." -Level Success
+})
+
+$btnSaveAsProfile.Add_Click({
+    $profileName = [Microsoft.VisualBasic.Interaction]::InputBox(
+        'Enter a name for this settings profile:',
+        'Save Settings Profile As',
+        'My Profile'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($profileName)) {
+        Write-Log 'Save As profile canceled.' -Level Warn
+        return
+    }
+
+    $safeName = Get-SafeProfileName -ProfileName $profileName
+    Save-UserSettings -TabControl $tabs -ProfileName $safeName
+    Refresh-SettingsProfileDropdown
+    $cmbSettingsProfile.SelectedItem = $safeName
+    Write-Log "Profile saved as '$safeName'." -Level Success
+})
+
+$btnLoadProfile.Add_Click({
+    if (-not $cmbSettingsProfile.SelectedItem) {
+        Show-Error 'Select a profile first.'
+        return
+    }
+
+    $selectedProfile = [string]$cmbSettingsProfile.SelectedItem
+    Apply-SettingsProfile -ProfileName $selectedProfile
+    Write-Log "Loaded profile '$selectedProfile'." -Level Success
+})
+
+# -----------------------------
+# Events - General
+# -----------------------------
+$btnGPing.Add_Click({ Invoke-PingButton -ComputerName $txtGComputer.Text.Trim() })
+
+$btnRestart.Add_Click({
+    $computer = $txtGComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $confirm = Show-YesNo "Restart $computer now?"
+    if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+        try {
+            if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+                return
+            }
+            Restart-RemoteComputerSafe -ComputerName $computer -Credential $script:AdminCredential
+            Write-Log "Reboot command sent to $computer." -Level Success
+        }
+        catch {
+            Show-Error "Failed to restart $computer.`r`n$($_.Exception.Message)"
+        }
+    }
+})
+
+$btnShutdown.Add_Click({
+    $computer = $txtGComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $confirm = Show-YesNo "Shutdown $computer now?"
+    if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+        try {
+            if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+                return
+            }
+            Shutdown-RemoteComputerSafe -ComputerName $computer -Credential $script:AdminCredential
+            Write-Log "Shutdown command sent to $computer." -Level Success
+        }
+        catch {
+            Show-Error "Failed to shutdown $computer.`r`n$($_.Exception.Message)"
+        }
+    }
+})
+
+$btnGPUpdate.Add_Click({ Invoke-GeneralAction -ComputerName $txtGComputer.Text.Trim() -Action 'GPUpdate' -OutputBox $txtGeneralOutput })
+$btnIPConfig.Add_Click({ Invoke-GeneralAction -ComputerName $txtGComputer.Text.Trim() -Action 'IPConfig' -OutputBox $txtGeneralOutput })
+$btnFlushDNS.Add_Click({ Invoke-GeneralAction -ComputerName $txtGComputer.Text.Trim() -Action 'FlushDNS' -OutputBox $txtGeneralOutput })
+$btnReleaseRenew.Add_Click({ Invoke-GeneralAction -ComputerName $txtGComputer.Text.Trim() -Action 'ReleaseRenew' -OutputBox $txtGeneralOutput })
+$btnGWindowsUpdateCheck.Add_Click({ Invoke-GeneralWindowsUpdateAction -Mode Check -OutputBox $txtGeneralOutput })
+$btnGWindowsUpdate.Add_Click({ Invoke-GeneralWindowsUpdateAction -Mode Install -OutputBox $txtGeneralOutput })
+
+# -----------------------------
+# Events - Delete Profiles
+# -----------------------------
+$btnDeletePing.Add_Click({ Invoke-PingButton -ComputerName $txtDeleteComputer.Text.Trim() })
+
+$btnLoadProfiles.Add_Click({
+    $computer = $txtDeleteComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $tableProfiles.Rows.Clear()
+    Write-Log "Loading profiles from $computer..."
+
+    try {
+        if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+            return
+        }
+
+        $profiles = Get-RemoteUserProfiles -ComputerName $computer -Credential $script:AdminCredential
+
+        foreach ($p in $profiles) {
+            $userName = Split-Path $p.LocalPath -Leaf
+            $row = $tableProfiles.NewRow()
+            $row['Select'] = $false
+            $row['UserName'] = $userName
+            $row['LocalPath'] = $p.LocalPath
+            $row['SID'] = $p.SID
+            $row['Loaded'] = [string]$p.Loaded
+            $row['LastUseTime'] = [string]$p.LastUseTime
+            [void]$tableProfiles.Rows.Add($row)
+        }
+
+        Write-Log "Loaded $($profiles.Count) profiles from $computer." -Level Success
+
+        if ($profiles.Count -eq 0) {
+            Show-Info "No non-special user profiles were found on $computer."
+        }
+    }
+    catch {
+        Show-Error "Failed to load profiles from $computer.`r`n$($_.Exception.Message)"
+    }
+})
+
+$btnDeleteProfiles.Add_Click({
+    $computer = $txtDeleteComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $selectedRows = @($tableProfiles.Rows | Where-Object { $_.Select -eq $true })
+    if (-not $selectedRows -or $selectedRows.Count -eq 0) {
+        Show-Error 'Select at least one profile to delete.'
+        return
+    }
+
+    $profileList = ($selectedRows | ForEach-Object { $_.UserName }) -join ', '
+    $confirm = Show-YesNo "This will permanently delete the selected user profile(s) from $($computer):`r`n`r`n$profileList`r`n`r`nContinue?"
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log 'Profile deletion canceled by user.' -Level Warn
+        return
+    }
+
+    foreach ($row in $selectedRows) {
+        try {
+            Write-Log "Deleting profile $($row.UserName) from $computer..."
+            Remove-RemoteUserProfile -ComputerName $computer -Credential $script:AdminCredential -Sid $row.SID -LocalPath $row.LocalPath | Out-Null
+            Write-Log "Deleted profile $($row.UserName) from $computer." -Level Success
+        }
+        catch {
+            Show-Error "Failed to delete profile $($row.UserName) from $computer.`r`n$($_.Exception.Message)"
+        }
+    }
+
+    $btnLoadProfiles.PerformClick()
+})
+
+# -----------------------------
+# Events - Account Management
+# -----------------------------
+$btnCreateAccount.Add_Click({
+    $first = $txtAcctFirstName.Text.Trim()
+    $last = $txtAcctLastName.Text.Trim()
+    $ou = $txtAcctOu.Text.Trim()
+    $password = $txtAcctPassword.Text
+    $domainDn = $txtAcctDomain.Text.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($first) -or [string]::IsNullOrWhiteSpace($last) -or [string]::IsNullOrWhiteSpace($ou)) {
+        Show-Error 'First name, last name, and OU are required to create an account.'
+        return
+    }
+
+    $previewInitial = $first.Substring(0, 1)
+    $previewUser = if ($ou.ToLower() -eq 'PLACEHOLDER') {
+        ("{0}{1}" -f $last, $previewInitial.ToLower()).ToLower()
+    }
+    else {
+        ("{0}{1}_{2}" -f $last, $previewInitial, $ou.ToLower()).ToLower()
+    }
+    $previewDisplay = if ($ou.ToLower() -eq 'PLACEHOLDER') { "$first $last" } else { "$first $last ($($ou.ToLower()))" }
+    $previewEmail = "PLACEHOLDER"
+
+    $ok = Show-YesNo "Create '$previewDisplay' with username '$previewUser' and email '$previewEmail'?"
+    if ($ok -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log "Create account canceled for proposed user $previewUser." -Level Warn
+        return
+    }
+
+    try {
+        Write-Log "Creating AD account for $first $last in OU $ou..."
+        $result = New-ADPl2User -FirstName $first -LastName $last -OuCode $ou -Password $password -DomainDn $domainDn -Credential $script:AdminCredential
+        $msg = "$($result.DisplayName) created successfully. Username: $($result.UserName), Email: $($result.Email), UID: $($result.UidNumber)"
+        $txtAcctOutput.AppendText($msg + [Environment]::NewLine)
+        Write-Log $msg -Level Success
+    }
+    catch {
+        Show-Error "Failed to create AD account for $first $last.`r`n$($_.Exception.Message)"
+    }
+})
+
+$btnSearchADUsers.Add_Click({
+    $term = $txtSearchAdUser.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($term)) {
+        Show-Error 'Enter a name, username, or email fragment to search AD.'
+        return
+    }
+
+    $tableADUserSearch.Rows.Clear()
+    try {
+        Write-Log "Searching AD users for '$term'..."
+        $results = Search-ADPl2Users -SearchTerm $term -Credential $script:AdminCredential
+        foreach ($user in $results) {
+            [void]$tableADUserSearch.Rows.Add([string]$user.SamAccountName, [string]$user.DisplayName, [string]$user.mail)
+        }
+
+        Write-Log "AD search returned $($results.Count) account(s) for '$term'." -Level Success
+        if ($results.Count -eq 0) {
+            $txtAcctOutput.AppendText("No AD accounts found for search '$term'." + [Environment]::NewLine)
+        }
+    }
+    catch {
+        Show-Error "AD search failed for '$term'.`r`n$($_.Exception.Message)"
+    }
+})
+
+$btnUseSelectedADUser.Add_Click({
+    if ($dgvADUserSearch.SelectedRows.Count -lt 1) {
+        Show-Error 'Select a user from search results first.'
+        return
+    }
+
+    $selectedUsername = [string]$dgvADUserSearch.SelectedRows[0].Cells['Username'].Value
+    if (-not [string]::IsNullOrWhiteSpace($selectedUsername)) {
+        $txtDeleteAcctUser.Text = $selectedUsername
+    }
+})
+
+$btnDeleteAccount.Add_Click({
+    $username = $txtDeleteAcctUser.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($username) -and $dgvADUserSearch.SelectedRows.Count -gt 0) {
+        $username = [string]$dgvADUserSearch.SelectedRows[0].Cells['Username'].Value
+    }
+
+    if ([string]::IsNullOrWhiteSpace($username)) {
+        Show-Error 'Enter the username or select a user from AD search results to delete from AD.'
+        return
+    }
+
+    $ok = Show-YesNo "Delete AD account '$username'? This cannot be undone."
+    if ($ok -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Log "Delete account canceled for $username." -Level Warn
+        return
+    }
+
+    try {
+        Write-Log "Deleting AD account $username..."
+        $result = Remove-ADPl2User -UserName $username -Credential $script:AdminCredential
+        $msg = "Deleted AD account $($result.UserName) ($($result.DisplayName))."
+        $txtAcctOutput.AppendText($msg + [Environment]::NewLine)
+        Write-Log $msg -Level Success
+    }
+    catch {
+        Show-Error "Failed to delete AD account $username.`r`n$($_.Exception.Message)"
+    }
+})
+
+# -----------------------------
+# Events - BitLocker
+# -----------------------------
+$btnBLPing.Add_Click({ Invoke-PingButton -ComputerName $txtBLComputer.Text.Trim() })
+
+$btnEnableBL.Add_Click({
+    $computer = $txtBLComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $txtBLKey.Text = ''
+    $txtBLFile.Text = ''
+    $btnBLReboot.Enabled = $false
+
+    try {
+        Write-Log "Starting BitLocker workflow on $computer using enableBL_Alldrives.ps1..."
+
+        if (-not (Test-RemoteAccess -ComputerName $computer -Credential $script:AdminCredential)) {
+            return
+        }
+
+        $result = Enable-RemoteBitLocker -ComputerName $computer -Credential $script:AdminCredential
+        $txtBLKey.Text = [string]$result.RecoveryKey
+        $txtBLFile.Text = [string]$result.FileContent
+        $btnBLReboot.Enabled = $true
+
+        Write-Log "BitLocker workflow completed on $computer. Output moved to PLACEHOLDER and recovery key displayed." -Level Success
+
+        $prompt = Show-YesNo "Check the above key. Proceed with rebooting machine?"
+        if ($prompt -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Restart-RemoteComputerSafe -ComputerName $computer -Credential $script:AdminCredential
+            Write-Log "Reboot command sent to $computer." -Level Success
+        }
+        else {
+            Write-Log "Reboot declined by user for $computer." -Level Warn
+        }
+    }
+    catch {
+        Show-Error "BitLocker workflow failed for $computer.`r`n$($_.Exception.Message)"
+    }
+})
+
+$btnBLReboot.Add_Click({
+    $computer = $txtBLComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    $confirm = Show-YesNo "Proceed with rebooting $computer?"
+    if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+        try {
+            Restart-RemoteComputerSafe -ComputerName $computer -Credential $script:AdminCredential
+            Write-Log "Reboot command sent to $computer." -Level Success
+        }
+        catch {
+            Show-Error "Failed to reboot $computer.`r`n$($_.Exception.Message)"
+        }
+    }
+})
+
+$btnBLLookup.Add_Click({
+    $computer = $txtBLLookupComputer.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        Show-Error 'Enter a computer name first. What did you think would happen?'
+        return
+    }
+
+    try {
+        Write-Log "Looking up archived BitLocker key for $computer..."
+        $result = Get-BitLockerKeyFromArchive -ComputerName $computer
+        $txtBLKey.Text = [string]$result.RecoveryKey
+        $txtBLFile.Text = [string]$result.FileContent
+        Write-Log "Archived BitLocker key loaded for $computer from $($result.FilePath)." -Level Success
+    }
+    catch {
+        Show-Error "Failed to retrieve archived BitLocker key for $computer.`r`n$($_.Exception.Message)"
+    }
+})
+
+Update-PopupTargetCountLabel -RawComputerInput $txtPopupComputers.Text -FilePathInput $txtCompFilePath.Text.Trim() -TargetLabel $lblPopupTargetCount
+Refresh-SettingsProfileDropdown
+$activeProfile = Get-ActiveProfileName
+if ($cmbSettingsProfile.Items.Contains($activeProfile)) {
+    $cmbSettingsProfile.SelectedItem = $activeProfile
+}
+Apply-SettingsProfile -ProfileName $activeProfile
+
+$script:settingsAutoSaveTimer = New-Object System.Windows.Forms.Timer
+$script:settingsAutoSaveTimer.Interval = 15000
+$script:settingsAutoSaveTimer.Add_Tick({
+    try {
+        Save-CurrentProfileSettings
+    }
+    catch {
+        Write-Log "Autosave warning: $($_.Exception.Message)" -Level Warn
+    }
+})
+$script:settingsAutoSaveTimer.Start()
+
+$form.Add_FormClosing({
+    try {
+        if ($script:settingsAutoSaveTimer) {
+            $script:settingsAutoSaveTimer.Stop()
+        }
+        if ($script:cookieTimer) {
+            $script:cookieTimer.Stop()
+        }
+        Save-CurrentProfileSettings
+    }
+    catch {
+        # Do not block app close for save failures.
+    }
+})
+
+Write-Log "Joe's System Services launched for $($script:AdminCredential.UserName)." -Level Success
+$tabs.SelectedTab = $tabWelcome
+
+[void]$form.ShowDialog()
