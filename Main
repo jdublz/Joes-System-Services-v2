@@ -30,18 +30,47 @@ $script:AccentColor = $script:DefaultAccentColor
 $script:IsDarkMode = $false
 $script:IsApplyingSettingsProfile = $false
 $script:ApplyThemeClickCount = 0
+$script:PrimaryActionClickCount = 0
 $script:SecretUnlocked = $false
 $script:SecretTabCreated = $false
+$script:SuperUserUnlocked = $false
+$script:SuperUserTabCreated = $false
+$script:tabSuperUser = $null
+$script:MouseMoverEnabled = $false
+$script:MouseMoveIntervalSeconds = 240
+$script:MouseMoveDurationSeconds = 4
+$script:MouseMoveStepMilliseconds = 50
+$script:MouseMoveMaxStepPixels = 8
+$script:MouseMoveBurstEnd = $null
+$script:MouseMoveNextAt = $null
+$script:MouseMoveSingleBurstActive = $false
+$script:MouseMoverRandom = [System.Random]::new()
+$script:mouseBurstTimer = $null
+$script:mouseStepTimer = $null
+$script:mouseCountdownTimer = $null
+$script:lblMouseMoverStatus = $null
+$script:lblMouseMoverCountdown = $null
+$script:btnMouseMoverStart = $null
+$script:btnMouseMoverStop = $null
+$script:btnMouseMoverNow = $null
 $script:CookieCount = 0.0
 $script:CookiesPerClick = 1.0
 $script:CookiesPerSecond = 0.0
 $script:CookieCritChance = 0.0
 $script:CookieCritMultiplier = 2.0
+$script:CookieSoftCapLevel = 25
+$script:CookieOverflowShards = 0
 $script:CookiePrestigeCount = 0
 $script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
 $script:CookieAscensionPoints = 0
 $script:CookieAscensionTree = @{ Click = 0; Automation = 0; Economy = 0; Luck = 0 }
 $script:CookieSeenMilestones = @{}
+$script:CookieOverflowUpgrades = [ordered]@{}
+$script:CookieOverflowUpgradeButtons = @{}
+$script:OverflowTabCreated = $false
+$script:OverflowUnlockedNotified = $false
+$script:tabOverflow = $null
+$script:MainTabControl = $null
 
 # -----------------------------
 # Helper functions
@@ -77,6 +106,97 @@ function Show-Info {
 function Show-YesNo {
     param([string]$Message)
     return [System.Windows.Forms.MessageBox]::Show($Message, $script:AppName, 'YesNo', 'Question')
+}
+
+function Ensure-MouseInteropType {
+    if ('MouseInterop' -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class MouseInterop
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int X, int Y);
+}
+"@
+}
+
+function Update-SuperUserUi {
+    if (-not $script:lblMouseMoverStatus) { return }
+    $modeText = if ($script:MouseMoverEnabled) { 'RUNNING' } else { 'STOPPED' }
+    $details = "Interval $($script:MouseMoveIntervalSeconds)s, Burst $($script:MouseMoveDurationSeconds)s, Step $($script:MouseMoveStepMilliseconds)ms, Max step $($script:MouseMoveMaxStepPixels)px"
+    $script:lblMouseMoverStatus.Text = "Mouse mover status: $modeText`r`n$details"
+    if ($script:lblMouseMoverCountdown) {
+        if (-not $script:MouseMoverEnabled) {
+            $script:lblMouseMoverCountdown.Text = 'Next movement: inactive'
+        }
+        elseif ($script:MouseMoveBurstEnd -and ((Get-Date) -lt $script:MouseMoveBurstEnd)) {
+            $burstLeft = [Math]::Max(0, [int][Math]::Ceiling(($script:MouseMoveBurstEnd - (Get-Date)).TotalSeconds))
+            $script:lblMouseMoverCountdown.Text = "Movement burst active: ${burstLeft}s remaining"
+        }
+        elseif ($script:MouseMoveNextAt) {
+            $secondsLeft = [Math]::Max(0, [int][Math]::Ceiling(($script:MouseMoveNextAt - (Get-Date)).TotalSeconds))
+            $script:lblMouseMoverCountdown.Text = "Next movement in: ${secondsLeft}s"
+        }
+        else {
+            $script:lblMouseMoverCountdown.Text = 'Next movement: pending'
+        }
+    }
+    if ($script:btnMouseMoverStart) { $script:btnMouseMoverStart.Enabled = (-not $script:MouseMoverEnabled) }
+    if ($script:btnMouseMoverStop) { $script:btnMouseMoverStop.Enabled = $script:MouseMoverEnabled }
+}
+
+function Set-SuperUserMouseMoverState {
+    param([Parameter(Mandatory)] [bool]$Enabled)
+
+    if ($Enabled) {
+        Ensure-MouseInteropType
+        $script:MouseMoverEnabled = $true
+        $script:MouseMoveSingleBurstActive = $false
+        $script:MouseMoveBurstEnd = $null
+        $script:MouseMoveNextAt = (Get-Date).AddSeconds($script:MouseMoveIntervalSeconds)
+        if ($script:mouseStepTimer) { $script:mouseStepTimer.Stop() }
+        if ($script:mouseBurstTimer) {
+            $script:mouseBurstTimer.Interval = [int]($script:MouseMoveIntervalSeconds * 1000)
+            $script:mouseBurstTimer.Start()
+        }
+        if ($script:mouseCountdownTimer) { $script:mouseCountdownTimer.Start() }
+        Write-Log "Super User mouse mover enabled. Burst every $($script:MouseMoveIntervalSeconds) seconds." -Level Success
+    }
+    else {
+        $script:MouseMoverEnabled = $false
+        $script:MouseMoveSingleBurstActive = $false
+        $script:MouseMoveBurstEnd = $null
+        $script:MouseMoveNextAt = $null
+        if ($script:mouseStepTimer) { $script:mouseStepTimer.Stop() }
+        if ($script:mouseBurstTimer) { $script:mouseBurstTimer.Stop() }
+        if ($script:mouseCountdownTimer) { $script:mouseCountdownTimer.Stop() }
+        Write-Log 'Super User mouse mover disabled.' -Level Info
+    }
+    Update-SuperUserUi
+}
+
+function Invoke-SuperUserMouseMoveBurstOnce {
+    Ensure-MouseInteropType
+    $script:MouseMoveSingleBurstActive = $true
+    $script:MouseMoveBurstEnd = (Get-Date).AddSeconds($script:MouseMoveDurationSeconds)
+    if ($script:mouseStepTimer) {
+        $script:mouseStepTimer.Interval = [int]$script:MouseMoveStepMilliseconds
+        $script:mouseStepTimer.Start()
+    }
+    Write-Log "Super User one-time mouse burst started for $($script:MouseMoveDurationSeconds) seconds." -Level Info
+    Update-SuperUserUi
 }
 
 function Get-UserSettingsRootPath {
@@ -353,7 +473,7 @@ function Get-BitLockerKeyFromArchive {
         [Parameter(Mandatory)] [string]$ComputerName
     )
 
-    $archiveFile = "PLACEHOLDER"
+    $archiveFile = "Insert network share path here"
 
     if (-not (Test-Path $archiveFile)) {
         throw "Archived BitLocker file not found: $archiveFile"
@@ -389,9 +509,9 @@ function Enable-RemoteBitLocker {
         [Parameter(Mandatory)] [pscredential]$Credential
     )
 
-    $driverScript = "PLACEHOLDER"
-    $shareSource  = "PLACEHOLDER"
-    $destFolder   = "PLACEHOLDER"
+    $driverScript = "Insert BitLocker driver script path here"
+    $shareSource  = "Insert remote share source path here"
+    $destFolder   = "Insert destination share path here"
     $destFile     = Join-Path $destFolder "${ComputerName}_BLout.txt"
 
     if (-not (Test-Path $driverScript)) {
@@ -693,7 +813,7 @@ function New-ADPl2User {
 
     $firstInitialLower = $first.Substring(0, 1).ToLower()
     $firstInitialUpper = $first.Substring(0, 1)
-    if ($ou -eq 'PLACEHOLDER') {
+    if ($ou -eq 'Placeholder') {
         $username = ("{0}{1}" -f $last, $firstInitialLower).ToLower()
         $displayName = "$first $last"
     }
@@ -702,7 +822,7 @@ function New-ADPl2User {
         $displayName = "$first $last ($ou)"
     }
 
-    $email = "PLACEHOLDER"
+    $email = "$username@Insert domain here"
     $secGroupPath = "OU=$ou,OU=SecurityGroups,OU=Groups,OU=PL2,$DomainDn"
     $securePassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
 
@@ -730,14 +850,14 @@ function New-ADPl2User {
 
     Set-ADUser -Identity $username -Replace @{
         msSFU30Name         = $username
-        msSFU30NisDomain    = 'PLACEHOLDER'
+        msSFU30NisDomain    = 'Insert nis domain here'
         loginShell          = '/bin/bash'
         uidNumber           = [string]$nextId
         uid                 = $username
         gidNumber           = '11000'
         unixHomeDirectory   = $homeDir
         primaryGroupID      = '513'
-        unixUserPassword    = 'ABCD!efg12345$67890'
+        unixUserPassword    = 'Insert password here'
         telephoneNumber     = [string]$nextId
         mail                = $email
     } -Credential $Credential -ErrorAction Stop
@@ -800,12 +920,31 @@ function Search-ADPl2Users {
 function Format-CookieNumber {
     param([double]$Value)
 
+    if ([double]::IsNaN($Value)) { return '0' }
+    if ([double]::IsPositiveInfinity($Value)) { return 'MAX' }
+    if ([double]::IsNegativeInfinity($Value)) { return '0' }
+    if ($Value -lt 0) { $Value = 0.0 }
+    if ($Value -ge 1000000000000000.0) { return ('{0:E2}' -f $Value) }
     if ($Value -ge 1000000000000) { return ('{0:N2}T' -f ($Value / 1000000000000.0)) }
     if ($Value -ge 1000000000) { return ('{0:N2}B' -f ($Value / 1000000000.0)) }
     if ($Value -ge 1000000) { return ('{0:N2}M' -f ($Value / 1000000.0)) }
     if ($Value -ge 1000) { return ('{0:N2}K' -f ($Value / 1000.0)) }
     if ($Value -ge 100) { return ('{0:N0}' -f $Value) }
     return ('{0:N1}' -f $Value)
+}
+
+function Normalize-CookieNumber {
+    param(
+        [double]$Value,
+        [double]$Fallback = 0.0,
+        [double]$Max = 1.0E+300
+    )
+    if ([double]::IsNaN($Value)) { return $Fallback }
+    if ([double]::IsPositiveInfinity($Value)) { return $Max }
+    if ([double]::IsNegativeInfinity($Value)) { return $Fallback }
+    if ($Value -lt 0) { return $Fallback }
+    if ($Value -gt $Max) { return $Max }
+    return $Value
 }
 
 function Initialize-CookieUpgrades {
@@ -825,14 +964,27 @@ function Initialize-CookieUpgrades {
         Lab = [pscustomobject]@{ Key='Lab'; Name='Quantum Oven Lab'; Type='Passive'; BaseCost=1400000.0; CostMultiplier=1.28; Gain=4300.0; OutputMultiplier=1.14; UnlockPrestige=3; Level=0 }
         Portal = [pscustomobject]@{ Key='Portal'; Name='Cookie Portal'; Type='Passive'; BaseCost=9000000.0; CostMultiplier=1.29; Gain=16500.0; OutputMultiplier=1.16; UnlockPrestige=5; Level=0 }
         PrismReactor = [pscustomobject]@{ Key='PrismReactor'; Name='Prism Reactor'; Type='Passive'; BaseCost=32000000.0; CostMultiplier=1.31; Gain=98000.0; OutputMultiplier=1.17; UnlockPrestige=10; Level=0 }
-        CelestialPrinter = [pscustomobject]@{ Key='CelestialPrinter'; Name='Celestial Printer'; Type='Passive'; BaseCost=52000000.0; CostMultiplier=1.30; Gain=52000.0; OutputMultiplier=1.18; UnlockPrestige=10; Level=0 }
-        SingularityForge = [pscustomobject]@{ Key='SingularityForge'; Name='Singularity Forge'; Type='Passive'; BaseCost=410000000.0; CostMultiplier=1.32; Gain=380000.0; OutputMultiplier=1.20; UnlockPrestige=15; Level=0 }
-        ChronoVault = [pscustomobject]@{ Key='ChronoVault'; Name='Chrono Vault'; Type='Passive'; BaseCost=650000000.0; CostMultiplier=1.33; Gain=620000.0; OutputMultiplier=1.21; UnlockPrestige=15; Level=0 }
+        CelestialPrinter = [pscustomobject]@{ Key='CelestialPrinter'; Name='Celestial Printer'; Type='Special'; BaseCost=52000000.0; CostMultiplier=1.30; Gain=0.0; OutputMultiplier=1.0; UnlockPrestige=30; Level=0 }
+        SingularityForge = [pscustomobject]@{ Key='SingularityForge'; Name='Singularity Forge'; Type='Special'; BaseCost=410000000.0; CostMultiplier=1.32; Gain=0.0; OutputMultiplier=1.0; UnlockPrestige=40; Level=0 }
+        ChronoVault = [pscustomobject]@{ Key='ChronoVault'; Name='Chrono Vault'; Type='Special'; BaseCost=650000000.0; CostMultiplier=1.33; Gain=0.0; OutputMultiplier=1.0; UnlockPrestige=50; Level=0 }
+    }
+}
+
+function Initialize-CookieOverflowUpgrades {
+    $script:CookieOverflowUpgrades = [ordered]@{
+        CapExtender = [pscustomobject]@{ Key='CapExtender'; Name='Cap Extender'; BaseShardCost=20; CostMultiplier=1.75; Description='Raises soft cap by +1 each rank.'; Level=0 }
+        HyperclickCore = [pscustomobject]@{ Key='HyperclickCore'; Name='Hyperclick Core'; BaseShardCost=15; CostMultiplier=1.65; Description='+12% total CPc each rank.'; Level=0 }
+        IdleReactor = [pscustomobject]@{ Key='IdleReactor'; Name='Idle Reactor'; BaseShardCost=15; CostMultiplier=1.65; Description='+14% total CPS each rank.'; Level=0 }
+        ShardRecycler = [pscustomobject]@{ Key='ShardRecycler'; Name='Shard Recycler'; BaseShardCost=25; CostMultiplier=1.85; Description='+20% overflow shard gain each rank.'; Level=0 }
+        PrestigeCatalyst = [pscustomobject]@{ Key='PrestigeCatalyst'; Name='Prestige Catalyst'; BaseShardCost=30; CostMultiplier=1.90; Description='+6% prestige perk potency each rank.'; Level=0 }
+        CritMatrix = [pscustomobject]@{ Key='CritMatrix'; Name='Crit Matrix'; BaseShardCost=28; CostMultiplier=1.86; Description='+1.5% crit chance and +0.20 crit power each rank.'; Level=0 }
+        QuantumCoil = [pscustomobject]@{ Key='QuantumCoil'; Name='Quantum Coil'; BaseShardCost=34; CostMultiplier=1.95; Description='+5% total CPc and CPS each rank.'; Level=0 }
+        TemporalCoupon = [pscustomobject]@{ Key='TemporalCoupon'; Name='Temporal Coupon'; BaseShardCost=40; CostMultiplier=2.00; Description='-4% prestige cost each rank (up to 70% off).' ; Level=0 }
     }
 }
 
 function Get-CookieMilestoneThresholds {
-    return @(3, 5, 10, 15)
+    return @(3, 5, 10, 15, 30, 40, 50)
 }
 
 function Get-CookieUnlockedUpgradeKeys {
@@ -859,8 +1011,13 @@ function Show-CookieEventBanner {
 }
 
 function Get-CookiePrestigeCost {
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
     $baseCost = 1000000.0
-    return [Math]::Round($baseCost * [Math]::Pow(1.85, [double]$script:CookiePrestigeCount), 2)
+    $raw = $baseCost * [Math]::Pow(1.85, [double]$script:CookiePrestigeCount)
+    $couponLevel = [int]$script:CookieOverflowUpgrades['TemporalCoupon'].Level
+    $discount = [Math]::Pow(0.96, $couponLevel)
+    if ($discount -lt 0.30) { $discount = 0.30 }
+    return [Math]::Round((Normalize-CookieNumber -Value ($raw * $discount) -Fallback $baseCost), 2)
 }
 
 function Get-CookieUpgradeCost {
@@ -871,15 +1028,17 @@ function Get-CookieUpgradeCost {
     $discountPerk = [int]$script:CookiePrestigePerkStacks['FrugalEngineering']
     $discountFactor = [Math]::Pow(0.92, $discountPerk)
     $economyDiscount = [Math]::Pow(0.95, [int]$script:CookieAscensionTree['Economy'])
+    $forgeDiscount = [Math]::Pow(0.94, [int]$script:CookieUpgrades['SingularityForge'].Level)
     $discountFactor *= $economyDiscount
-    if ($discountFactor -lt 0.30) { $discountFactor = 0.30 }
+    $discountFactor *= $forgeDiscount
+    if ($discountFactor -lt 0.15) { $discountFactor = 0.15 }
     return [Math]::Round(($baseCost * $discountFactor), 2)
 }
 
 function Recalculate-CookieRates {
     $script:CookiesPerClick = 1.0
     $script:CookiesPerSecond = 0.0
-    $script:CookieCritChance = [Math]::Min(0.60, 0.03 * [int]$script:CookieAscensionTree['Luck'])
+    $script:CookieCritChance = [Math]::Min(0.75, 0.03 * [int]$script:CookieAscensionTree['Luck'])
     $script:CookieCritMultiplier = 2.0 + (0.40 * [int]$script:CookieAscensionTree['Luck'])
 
     foreach ($upgrade in $script:CookieUpgrades.Values) {
@@ -903,8 +1062,14 @@ function Recalculate-CookieRates {
         }
     }
 
-    $clickPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['ClickMastery'])
-    $autoPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['AutomationSurge'])
+    $forgeLevel = [int]$script:CookieUpgrades['SingularityForge'].Level
+    $echoLevel = [int]$script:CookieUpgrades['CelestialPrinter'].Level
+    $vaultLevel = [int]$script:CookieUpgrades['ChronoVault'].Level
+
+    $catalystLevel = [int]$script:CookieOverflowUpgrades['PrestigeCatalyst'].Level
+    $perkPotency = 1.0 + (0.05 * $forgeLevel) + (0.06 * $catalystLevel)
+    $clickPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['ClickMastery'] * $perkPotency)
+    $autoPerkBoost = [Math]::Pow(1.25, [int]$script:CookiePrestigePerkStacks['AutomationSurge'] * $perkPotency)
     $clickAscensionBoost = [Math]::Pow(1.07, [int]$script:CookieAscensionTree['Click'])
     $autoAscensionBoost = [Math]::Pow(1.13, [int]$script:CookieAscensionTree['Automation'])
     $luckCpsBoost = [Math]::Pow(1.03, [int]$script:CookieAscensionTree['Luck'])
@@ -913,6 +1078,29 @@ function Recalculate-CookieRates {
     $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * $clickAscensionBoost), 4)
     $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $autoAscensionBoost), 4)
     $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $luckCpsBoost), 4)
+
+    # Endgame mechanics from special upgrades.
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * [Math]::Pow(1.08, $echoLevel)), 4)
+    $critMatrixLevel = [int]$script:CookieOverflowUpgrades['CritMatrix'].Level
+    $script:CookieCritChance = [Math]::Min(0.90, ($script:CookieCritChance + (0.02 * $echoLevel) + (0.015 * $critMatrixLevel)))
+    $script:CookieCritMultiplier = [Math]::Round(($script:CookieCritMultiplier + (0.10 * $echoLevel) + (0.20 * $critMatrixLevel)), 3)
+
+    $vaultPrestigeBoost = 1.0 + (0.02 * $vaultLevel * [int]$script:CookiePrestigeCount)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * $vaultPrestigeBoost), 4)
+    $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * (1.0 + (0.01 * $vaultLevel * [int]$script:CookiePrestigeCount))), 4)
+
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) {
+        Initialize-CookieOverflowUpgrades
+    }
+    $hyperclickLevel = [int]$script:CookieOverflowUpgrades['HyperclickCore'].Level
+    $idleReactorLevel = [int]$script:CookieOverflowUpgrades['IdleReactor'].Level
+    $coilLevel = [int]$script:CookieOverflowUpgrades['QuantumCoil'].Level
+    $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * [Math]::Pow(1.12, $hyperclickLevel)), 4)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * [Math]::Pow(1.14, $idleReactorLevel)), 4)
+    $script:CookiesPerClick = [Math]::Round(($script:CookiesPerClick * [Math]::Pow(1.05, $coilLevel)), 4)
+    $script:CookiesPerSecond = [Math]::Round(($script:CookiesPerSecond * [Math]::Pow(1.05, $coilLevel)), 4)
+    $script:CookiesPerClick = Normalize-CookieNumber -Value $script:CookiesPerClick -Fallback 1.0
+    $script:CookiesPerSecond = Normalize-CookieNumber -Value $script:CookiesPerSecond -Fallback 0.0
 }
 
 function Get-CookieUpgradeNextGain {
@@ -927,6 +1115,7 @@ function Get-CookieUpgradeNextGain {
 
 function Get-CookieClickerSaveState {
     if (-not $script:CookieUpgrades) { Initialize-CookieUpgrades }
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
     return [pscustomobject]@{
         CookieCount = [double]$script:CookieCount
         PrestigeCount = [int]$script:CookiePrestigeCount
@@ -942,6 +1131,20 @@ function Get-CookieClickerSaveState {
             Economy = [int]$script:CookieAscensionTree['Economy']
             Luck = [int]$script:CookieAscensionTree['Luck']
         }
+        Overflow = [pscustomobject]@{
+            SoftCapLevel = [int]$script:CookieSoftCapLevel
+            Shards = [int]$script:CookieOverflowShards
+            UpgradeLevels = [pscustomobject]@{
+                CapExtender = [int]$script:CookieOverflowUpgrades['CapExtender'].Level
+                HyperclickCore = [int]$script:CookieOverflowUpgrades['HyperclickCore'].Level
+                IdleReactor = [int]$script:CookieOverflowUpgrades['IdleReactor'].Level
+                ShardRecycler = [int]$script:CookieOverflowUpgrades['ShardRecycler'].Level
+                PrestigeCatalyst = [int]$script:CookieOverflowUpgrades['PrestigeCatalyst'].Level
+                CritMatrix = [int]$script:CookieOverflowUpgrades['CritMatrix'].Level
+                QuantumCoil = [int]$script:CookieOverflowUpgrades['QuantumCoil'].Level
+                TemporalCoupon = [int]$script:CookieOverflowUpgrades['TemporalCoupon'].Level
+            }
+        }
         Upgrades = @($script:CookieUpgrades.Values | ForEach-Object {
             [pscustomobject]@{
                 Key = $_.Key
@@ -955,10 +1158,16 @@ function Import-CookieClickerSaveState {
     param($SavedState)
 
     if (-not $script:CookieUpgrades) { Initialize-CookieUpgrades }
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
     $script:CookiePrestigeCount = 0
     $script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
     $script:CookieAscensionPoints = 0
     $script:CookieAscensionTree = @{ Click = 0; Automation = 0; Economy = 0; Luck = 0 }
+    $script:CookieOverflowShards = 0
+    $script:CookieSoftCapLevel = 25
+    foreach ($overflowUpgrade in $script:CookieOverflowUpgrades.Values) {
+        $overflowUpgrade.Level = 0
+    }
     $script:CookieSeenMilestones = @{}
     $script:CookieCount = 0.0
     foreach ($upgrade in $script:CookieUpgrades.Values) {
@@ -967,7 +1176,7 @@ function Import-CookieClickerSaveState {
 
     if ($SavedState) {
         if ($SavedState.PSObject.Properties.Name -contains 'CookieCount') {
-            $script:CookieCount = [Math]::Max(0.0, [double]$SavedState.CookieCount)
+            $script:CookieCount = Normalize-CookieNumber -Value ([double]$SavedState.CookieCount) -Fallback 0.0
         }
 
         if ($SavedState.PSObject.Properties.Name -contains 'PrestigeCount') {
@@ -988,6 +1197,21 @@ function Import-CookieClickerSaveState {
             foreach ($branch in @('Click', 'Automation', 'Economy', 'Luck')) {
                 if ($SavedState.Ascension.PSObject.Properties.Name -contains $branch) {
                     $script:CookieAscensionTree[$branch] = [Math]::Max(0, [int]$SavedState.Ascension.$branch)
+                }
+            }
+        }
+        if ($SavedState.PSObject.Properties.Name -contains 'Overflow' -and $SavedState.Overflow) {
+            if ($SavedState.Overflow.PSObject.Properties.Name -contains 'SoftCapLevel') {
+                $script:CookieSoftCapLevel = [Math]::Max(1, [int]$SavedState.Overflow.SoftCapLevel)
+            }
+            if ($SavedState.Overflow.PSObject.Properties.Name -contains 'Shards') {
+                $script:CookieOverflowShards = [Math]::Max(0, [int]$SavedState.Overflow.Shards)
+            }
+            if ($SavedState.Overflow.PSObject.Properties.Name -contains 'UpgradeLevels' -and $SavedState.Overflow.UpgradeLevels) {
+                foreach ($overflowKey in @('CapExtender','HyperclickCore','IdleReactor','ShardRecycler','PrestigeCatalyst','CritMatrix','QuantumCoil','TemporalCoupon')) {
+                    if ($SavedState.Overflow.UpgradeLevels.PSObject.Properties.Name -contains $overflowKey) {
+                        $script:CookieOverflowUpgrades[$overflowKey].Level = [Math]::Max(0, [int]$SavedState.Overflow.UpgradeLevels.$overflowKey)
+                    }
                 }
             }
         }
@@ -1014,12 +1238,17 @@ function Import-CookieClickerSaveState {
 
 function Update-CookieClickerUi {
     if (-not $script:lblCookieCount) { return }
+    Ensure-CookieOverflowTabUnlocked
+    $script:CookieCount = Normalize-CookieNumber -Value $script:CookieCount -Fallback 0.0
+    $script:CookiesPerClick = Normalize-CookieNumber -Value $script:CookiesPerClick -Fallback 1.0
+    $script:CookiesPerSecond = Normalize-CookieNumber -Value $script:CookiesPerSecond -Fallback 0.0
 
     $script:lblCookieCount.Text = "Cookies: $(Format-CookieNumber -Value $script:CookieCount)"
     $script:lblCookieStats.Text = "CPc: $(Format-CookieNumber -Value $script:CookiesPerClick)   |   CPS: $(Format-CookieNumber -Value $script:CookiesPerSecond)"
     if ($script:lblPrestigeInfo) {
         $cost = Get-CookiePrestigeCost
-        $script:lblPrestigeInfo.Text = "Prestiges: $($script:CookiePrestigeCount)  |  Next Cost: $(Format-CookieNumber -Value $cost)"
+        $pendingShards = Get-CookieOverflowShardsFromCurrentRun
+        $script:lblPrestigeInfo.Text = "Prestiges: $($script:CookiePrestigeCount)  |  Next Cost: $(Format-CookieNumber -Value $cost)  |  Soft Cap L$($script:CookieSoftCapLevel) -> +$pendingShards Shards"
     }
     if ($script:lblPrestigePerks) {
         $script:lblPrestigePerks.Text = "Perks - Click Mastery: $($script:CookiePrestigePerkStacks['ClickMastery'])  |  Automation Surge: $($script:CookiePrestigePerkStacks['AutomationSurge'])  |  Frugal Engineering: $($script:CookiePrestigePerkStacks['FrugalEngineering'])"
@@ -1034,8 +1263,9 @@ function Update-CookieClickerUi {
     if ($script:lblAscensionInfo) {
         $spent = [int]$script:CookieAscensionTree['Click'] + [int]$script:CookieAscensionTree['Automation'] + [int]$script:CookieAscensionTree['Economy'] + [int]$script:CookieAscensionTree['Luck']
         $available = [Math]::Max(0, [int]$script:CookieAscensionPoints - $spent)
-        $script:lblAscensionInfo.Text = "Ascension Points: $available (Total $($script:CookieAscensionPoints))"
+        $script:lblAscensionInfo.Text = "Ascension Points: $available (Total $($script:CookieAscensionPoints)) | Overflow Shards: $($script:CookieOverflowShards)"
     }
+    Update-CookieOverflowUi
     if ($script:lblAscensionHint) {
         $clickLevel = [int]$script:CookieAscensionTree['Click']
         $autoLevel = [int]$script:CookieAscensionTree['Automation']
@@ -1049,7 +1279,10 @@ function Update-CookieClickerUi {
         $luckCritPower = [Math]::Round((0.40 * $luckLevel), 2)
         $luckCpsPct = [Math]::Round((([Math]::Pow(1.03, $luckLevel) - 1.0) * 100.0), 1)
 
-        $script:lblAscensionHint.Text = "Ascension Effects: CPc +$clickBoostPct% | CPS +$autoBoostPct% | Costs -$economyCostPct% | Luck: Crit +$luckCritChance%, +$luckCritPower power, CPS +$luckCpsPct%"
+        $echoLevel = [int]$script:CookieUpgrades['CelestialPrinter'].Level
+        $forgeLevel = [int]$script:CookieUpgrades['SingularityForge'].Level
+        $vaultLevel = [int]$script:CookieUpgrades['ChronoVault'].Level
+        $script:lblAscensionHint.Text = "Ascension Effects: CPc +$clickBoostPct% | CPS +$autoBoostPct% | Costs -$economyCostPct% | Luck: Crit +$luckCritChance%, +$luckCritPower power, CPS +$luckCpsPct% | Endgame L30/L40/L50: Echo L$echoLevel, Forge L$forgeLevel, Vault L$vaultLevel"
     }
     if ($script:btnAscClick) { $script:btnAscClick.Text = "Click Path (Level $($script:CookieAscensionTree['Click']))" }
     if ($script:btnAscAuto) { $script:btnAscAuto.Text = "Automation (Level $($script:CookieAscensionTree['Automation']))" }
@@ -1082,7 +1315,7 @@ function Update-CookieClickerUi {
         $btn.Location = New-Object System.Drawing.Point(($col * ($script:CookieShopBtnWidth + $script:CookieShopColGap)), ($row * ($script:CookieShopBtnHeight + $script:CookieShopRowGap)))
         $visibleIndex++
 
-        $gainUnit = if ($upgrade.Type -eq 'Click') { 'CPc' } else { 'CPS' }
+        $gainUnit = if ($upgrade.Type -eq 'Click') { 'CPc' } elseif ($upgrade.Type -eq 'Passive') { 'CPS' } else { 'Special' }
         $isUnlocked = ($unlockedUpgradeKeys -contains $upgrade.Key)
         if (-not $isUnlocked) {
             $requiredPrestige = if ($upgrade.PSObject.Properties.Name -contains 'UnlockPrestige') { [int]$upgrade.UnlockPrestige } else { 0 }
@@ -1093,8 +1326,19 @@ function Update-CookieClickerUi {
         }
 
         $cost = Get-CookieUpgradeCost -UpgradeKey $upgrade.Key
-        $nextGain = Get-CookieUpgradeNextGain -UpgradeKey $upgrade.Key
-        $btn.Text = "$($upgrade.Name)  Level $($upgrade.Level)`r`n+$(Format-CookieNumber -Value $nextGain) $gainUnit  |  Cost $(Format-CookieNumber -Value $cost)"
+        if ($upgrade.Type -eq 'Special') {
+            $specialLine = switch ($upgrade.Key) {
+                'CelestialPrinter' { '+8% CPS, +2% crit chance, +0.10 crit power per level' }
+                'SingularityForge' { '-6% upgrade costs +5% prestige perk potency per level' }
+                'ChronoVault' { '+2% CPS and +1% CPc per prestige per level' }
+                default { 'Special endgame effect' }
+            }
+            $btn.Text = "$($upgrade.Name)  Level $($upgrade.Level)`r`n$specialLine  |  Cost $(Format-CookieNumber -Value $cost)"
+        }
+        else {
+            $nextGain = Get-CookieUpgradeNextGain -UpgradeKey $upgrade.Key
+            $btn.Text = "$($upgrade.Name)  Level $($upgrade.Level)`r`n+$(Format-CookieNumber -Value $nextGain) $gainUnit  |  Cost $(Format-CookieNumber -Value $cost)"
+        }
         $affordable = ($script:CookieCount -ge $cost)
         $btn.BackColor = if ($affordable) { [System.Drawing.Color]::FromArgb(228, 171, 89) } else { [System.Drawing.Color]::FromArgb(117, 93, 183) }
         $btn.ForeColor = if ($affordable) { [System.Drawing.Color]::FromArgb(35, 24, 20) } else { [System.Drawing.Color]::FromArgb(244, 240, 255) }
@@ -1111,6 +1355,7 @@ function Invoke-CookiePurchase {
     if ($script:CookieCount -lt $cost) { return $false }
 
     $script:CookieCount -= $cost
+    $script:CookieCount = Normalize-CookieNumber -Value $script:CookieCount -Fallback 0.0
     $script:CookieUpgrades[$UpgradeKey].Level++
     Recalculate-CookieRates
     Update-CookieClickerUi
@@ -1129,6 +1374,168 @@ function Get-CookieAscensionBranchDescription {
         'Automation' { return '+13% total CPS per level' }
         'Economy' { return '-5% upgrade costs per level (stacks)' }
         'Luck' { return '+3% crit chance, +0.40 crit power, and +3% CPS per level' }
+    }
+}
+
+function Get-CookieOverflowUpgradeCost {
+    param([Parameter(Mandatory)] [string]$UpgradeKey)
+    if (-not $script:CookieOverflowUpgrades -or -not $script:CookieOverflowUpgrades.Contains($UpgradeKey)) { return [int]::MaxValue }
+    $upgrade = $script:CookieOverflowUpgrades[$UpgradeKey]
+    return [int][Math]::Ceiling($upgrade.BaseShardCost * [Math]::Pow($upgrade.CostMultiplier, [int]$upgrade.Level))
+}
+
+function Get-CookieOverflowShardsFromCurrentRun {
+    if (-not $script:CookieUpgrades -or $script:CookieUpgrades.Count -eq 0) { return 0 }
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
+    $overflowLevels = 0
+    foreach ($upgrade in $script:CookieUpgrades.Values) {
+        if ($upgrade.Level -gt $script:CookieSoftCapLevel) {
+            $overflowLevels += ([int]$upgrade.Level - [int]$script:CookieSoftCapLevel)
+        }
+    }
+    $vaultLevel = 0
+    if ($script:CookieUpgrades.Contains('ChronoVault')) {
+        $vaultLevel = [int]$script:CookieUpgrades['ChronoVault'].Level
+    }
+    $mult = 1.0 + (0.25 * $vaultLevel)
+    $recyclerLevel = [int]$script:CookieOverflowUpgrades['ShardRecycler'].Level
+    $mult *= [Math]::Pow(1.20, $recyclerLevel)
+    return [int][Math]::Floor($overflowLevels * $mult)
+}
+
+function Invoke-CookieOverflowPurchase {
+    param([Parameter(Mandatory)] [string]$UpgradeKey)
+    if (-not $script:CookieOverflowUpgrades -or -not $script:CookieOverflowUpgrades.Contains($UpgradeKey)) { return $false }
+    $cost = Get-CookieOverflowUpgradeCost -UpgradeKey $UpgradeKey
+    if ($script:CookieOverflowShards -lt $cost) { return $false }
+
+    $script:CookieOverflowShards -= $cost
+    $script:CookieOverflowUpgrades[$UpgradeKey].Level = [int]$script:CookieOverflowUpgrades[$UpgradeKey].Level + 1
+    if ($UpgradeKey -eq 'CapExtender') {
+        $script:CookieSoftCapLevel = [int]$script:CookieSoftCapLevel + 1
+    }
+    Recalculate-CookieRates
+    Update-CookieClickerUi
+    Save-CurrentProfileSettings
+    Write-Log "Overflow upgrade purchased: $UpgradeKey (level $($script:CookieOverflowUpgrades[$UpgradeKey].Level))." -Level Success
+    return $true
+}
+
+function Update-CookieOverflowUi {
+    if (-not $script:OverflowTabCreated -or -not $script:lblOverflowShards) { return }
+    $script:lblOverflowShards.Text = "Overflow Shards: $($script:CookieOverflowShards)    Soft Cap: L$($script:CookieSoftCapLevel)"
+    if ($script:lblOverflowHint) {
+        $pending = Get-CookieOverflowShardsFromCurrentRun
+        $script:lblOverflowHint.Text = "Current run would convert to +$pending shards on prestige."
+    }
+    foreach ($upgrade in $script:CookieOverflowUpgrades.Values) {
+        if (-not $script:CookieOverflowUpgradeButtons.Contains($upgrade.Key)) { continue }
+        $btn = $script:CookieOverflowUpgradeButtons[$upgrade.Key]
+        $cost = Get-CookieOverflowUpgradeCost -UpgradeKey $upgrade.Key
+        $btn.Text = "$($upgrade.Name)  L$($upgrade.Level)`r`n$($upgrade.Description)  |  Cost: $cost shards"
+        $btn.Enabled = ($script:CookieOverflowShards -ge $cost)
+    }
+}
+
+function Initialize-OverflowTab {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Forms.TabControl]$TabControl
+    )
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
+    if ($script:OverflowTabCreated -and $script:tabOverflow) {
+        if (-not $TabControl.TabPages.Contains($script:tabOverflow)) {
+            [void]$TabControl.TabPages.Add($script:tabOverflow)
+        }
+        return $script:tabOverflow
+    }
+
+    $script:CookieOverflowUpgradeButtons = @{}
+    $script:tabOverflow = New-Object System.Windows.Forms.TabPage
+    $script:tabOverflow.Text = 'Overflow'
+    $script:tabOverflow.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 30)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'
+    $header.Height = 86
+    $header.BackColor = [System.Drawing.Color]::FromArgb(59, 43, 99)
+    $script:tabOverflow.Controls.Add($header)
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = 'Overflow Forge'
+    $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 21)
+    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(255, 236, 180)
+    $lblTitle.AutoSize = $true
+    $lblTitle.Location = New-Object System.Drawing.Point(18, 6)
+    $header.Controls.Add($lblTitle)
+
+    $lblSub = New-Object System.Windows.Forms.Label
+    $lblSub.Text = 'Spend overflow shards on permanent endgame upgrades.'
+    $lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $lblSub.ForeColor = [System.Drawing.Color]::White
+    $lblSub.AutoSize = $true
+    $lblSub.Location = New-Object System.Drawing.Point(20, 50)
+    $header.Controls.Add($lblSub)
+
+    $script:lblOverflowShards = New-Object System.Windows.Forms.Label
+    $script:lblOverflowShards.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 13)
+    $script:lblOverflowShards.ForeColor = [System.Drawing.Color]::FromArgb(236, 236, 255)
+    $script:lblOverflowShards.AutoSize = $true
+    $script:lblOverflowShards.Location = New-Object System.Drawing.Point(22, 104)
+    $script:tabOverflow.Controls.Add($script:lblOverflowShards)
+
+    $script:lblOverflowHint = New-Object System.Windows.Forms.Label
+    $script:lblOverflowHint.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $script:lblOverflowHint.ForeColor = [System.Drawing.Color]::FromArgb(204, 204, 232)
+    $script:lblOverflowHint.AutoSize = $true
+    $script:lblOverflowHint.Location = New-Object System.Drawing.Point(24, 132)
+    $script:tabOverflow.Controls.Add($script:lblOverflowHint)
+
+    $shopGrid = New-Object System.Windows.Forms.Panel
+    $shopGrid.Location = New-Object System.Drawing.Point(24, 168)
+    $shopGrid.Size = New-Object System.Drawing.Size(1000, 430)
+    $shopGrid.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 30)
+    $script:tabOverflow.Controls.Add($shopGrid)
+
+    $index = 0
+    foreach ($upgrade in $script:CookieOverflowUpgrades.Values) {
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Tag = $upgrade.Key
+        $btn.Size = New-Object System.Drawing.Size(492, 84)
+        $x = if (($index % 2) -eq 0) { 0 } else { 504 }
+        $y = [int][Math]::Floor($index / 2) * 92
+        $btn.Location = New-Object System.Drawing.Point($x, $y)
+        $btn.FlatStyle = 'Flat'
+        $btn.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+        $btn.TextAlign = 'MiddleLeft'
+        $btn.BackColor = [System.Drawing.Color]::FromArgb(88, 70, 150)
+        $btn.ForeColor = [System.Drawing.Color]::White
+        $btn.Add_Click({
+            $upgradeKey = [string]$this.Tag
+            $purchased = Invoke-CookieOverflowPurchase -UpgradeKey $upgradeKey
+            if (-not $purchased) { [System.Media.SystemSounds]::Beep.Play() }
+        })
+        [void]$shopGrid.Controls.Add($btn)
+        $script:CookieOverflowUpgradeButtons[$upgrade.Key] = $btn
+        $index++
+    }
+
+    [void]$TabControl.TabPages.Add($script:tabOverflow)
+    $script:OverflowTabCreated = $true
+    Update-CookieOverflowUi
+    return $script:tabOverflow
+}
+
+function Ensure-CookieOverflowTabUnlocked {
+    if (-not $script:MainTabControl) { return }
+    if (-not $script:SecretTabCreated) { return }
+    if ($script:CookieOverflowShards -le 0) { return }
+    $overflowTab = Initialize-OverflowTab -TabControl $script:MainTabControl
+    if (-not $script:OverflowUnlockedNotified) {
+        $script:OverflowUnlockedNotified = $true
+        Show-CookieEventBanner -Message 'Overflow unlocked: new shard shop tab available!' -BackColor ([System.Drawing.Color]::FromArgb(98, 72, 159))
+        if ($overflowTab) {
+            $script:MainTabControl.SelectedTab = $overflowTab
+        }
     }
 }
 
@@ -1168,6 +1575,20 @@ function Reset-CookieRunState {
 function Reset-CookieAllProgress {
     $script:CookiePrestigeCount = 0
     $script:CookiePrestigePerkStacks = @{ ClickMastery = 0; AutomationSurge = 0; FrugalEngineering = 0 }
+    $script:CookieAscensionPoints = 0
+    $script:CookieAscensionTree = @{ Click = 0; Automation = 0; Economy = 0; Luck = 0 }
+    $script:CookieOverflowShards = 0
+    $script:CookieSoftCapLevel = 25
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) { Initialize-CookieOverflowUpgrades }
+    foreach ($overflowUpgrade in $script:CookieOverflowUpgrades.Values) {
+        $overflowUpgrade.Level = 0
+    }
+    if ($script:MainTabControl -and $script:tabOverflow -and $script:MainTabControl.TabPages.Contains($script:tabOverflow)) {
+        $script:MainTabControl.TabPages.Remove($script:tabOverflow)
+    }
+    $script:OverflowTabCreated = $false
+    $script:OverflowUnlockedNotified = $false
+    $script:tabOverflow = $null
     Reset-CookieRunState
 }
 
@@ -1247,6 +1668,7 @@ function Show-CookiePrestigePerkPicker {
 
 function Invoke-CookiePrestige {
     $cost = Get-CookiePrestigeCost
+    $script:CookieCount = Normalize-CookieNumber -Value $script:CookieCount -Fallback 0.0
     if ($script:CookieCount -lt $cost) {
         Show-Info "Need $(Format-CookieNumber -Value $cost) cookies to prestige."
         return $false
@@ -1265,12 +1687,14 @@ function Invoke-CookiePrestige {
 
     try {
         $beforeCookies = [double]$script:CookieCount
+        $overflowShards = Get-CookieOverflowShardsFromCurrentRun
         $script:CookiePrestigeCount++
         $script:CookieAscensionPoints++
+        $script:CookieOverflowShards += $overflowShards
         $script:CookiePrestigePerkStacks[$selectedPerk] = [int]$script:CookiePrestigePerkStacks[$selectedPerk] + 1
         Reset-CookieRunState
         Invoke-CookieMilestoneCheck
-        Show-CookieEventBanner -Message "Prestige complete! +1 Ascension Point earned." -BackColor ([System.Drawing.Color]::FromArgb(170, 76, 139))
+        Show-CookieEventBanner -Message "Prestige complete! +1 Ascension Point, +$overflowShards Overflow Shards." -BackColor ([System.Drawing.Color]::FromArgb(170, 76, 139))
         Update-CookieClickerUi
         Save-CurrentProfileSettings
         Write-Log "Prestige complete. Cost gate met at $(Format-CookieNumber -Value $cost), cookies before reset: $(Format-CookieNumber -Value $beforeCookies). Perk: $selectedPerk. Total prestiges: $($script:CookiePrestigeCount)." -Level Success
@@ -1307,6 +1731,171 @@ function Invoke-CookieStartOver {
     }
 }
 
+function Initialize-SuperUserTab {
+    param(
+        [Parameter(Mandatory)] [System.Windows.Forms.TabControl]$TabControl
+    )
+
+    if ($script:SuperUserTabCreated -and $script:tabSuperUser) {
+        if (-not $TabControl.TabPages.Contains($script:tabSuperUser)) {
+            [void]$TabControl.TabPages.Add($script:tabSuperUser)
+        }
+        return $script:tabSuperUser
+    }
+
+    $script:tabSuperUser = New-Object System.Windows.Forms.TabPage
+    $script:tabSuperUser.Text = 'Super User'
+    $script:tabSuperUser.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 44)
+
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock = 'Top'
+    $header.Height = 92
+    $header.BackColor = [System.Drawing.Color]::FromArgb(70, 54, 118)
+    $script:tabSuperUser.Controls.Add($header)
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = 'Super User Controls'
+    $lblTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20)
+    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(255, 236, 174)
+    $lblTitle.AutoSize = $true
+    $lblTitle.Location = New-Object System.Drawing.Point(16, 8)
+    $header.Controls.Add($lblTitle)
+
+    $lblSubtitle = New-Object System.Windows.Forms.Label
+    $lblSubtitle.Text = 'Hidden automation tools for trusted operators.'
+    $lblSubtitle.Font = New-Object System.Drawing.Font('Segoe UI', 10.5)
+    $lblSubtitle.ForeColor = [System.Drawing.Color]::White
+    $lblSubtitle.AutoSize = $true
+    $lblSubtitle.Location = New-Object System.Drawing.Point(20, 52)
+    $header.Controls.Add($lblSubtitle)
+
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location = New-Object System.Drawing.Point(24, 118)
+    $card.Size = New-Object System.Drawing.Size(1000, 210)
+    $card.BackColor = [System.Drawing.Color]::FromArgb(42, 42, 62)
+    $card.BorderStyle = 'FixedSingle'
+    $script:tabSuperUser.Controls.Add($card)
+
+    $lblCardTitle = New-Object System.Windows.Forms.Label
+    $lblCardTitle.Text = 'Random Mouse Mover'
+    $lblCardTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
+    $lblCardTitle.ForeColor = [System.Drawing.Color]::FromArgb(236, 236, 252)
+    $lblCardTitle.AutoSize = $true
+    $lblCardTitle.Location = New-Object System.Drawing.Point(16, 12)
+    $card.Controls.Add($lblCardTitle)
+
+    $lblCardDesc = New-Object System.Windows.Forms.Label
+    $lblCardDesc.Text = 'Moves cursor in tiny random bursts every 4 minutes (for 4 seconds), while keeping the rest of JSS usable.'
+    $lblCardDesc.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $lblCardDesc.ForeColor = [System.Drawing.Color]::FromArgb(212, 212, 236)
+    $lblCardDesc.AutoSize = $true
+    $lblCardDesc.Location = New-Object System.Drawing.Point(18, 46)
+    $card.Controls.Add($lblCardDesc)
+
+    $script:lblMouseMoverStatus = New-Object System.Windows.Forms.Label
+    $script:lblMouseMoverStatus.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $script:lblMouseMoverStatus.ForeColor = [System.Drawing.Color]::FromArgb(228, 228, 248)
+    $script:lblMouseMoverStatus.AutoSize = $true
+    $script:lblMouseMoverStatus.Location = New-Object System.Drawing.Point(18, 84)
+    $card.Controls.Add($script:lblMouseMoverStatus)
+
+    $script:lblMouseMoverCountdown = New-Object System.Windows.Forms.Label
+    $script:lblMouseMoverCountdown.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
+    $script:lblMouseMoverCountdown.ForeColor = [System.Drawing.Color]::FromArgb(255, 234, 175)
+    $script:lblMouseMoverCountdown.AutoSize = $true
+    $script:lblMouseMoverCountdown.Location = New-Object System.Drawing.Point(18, 128)
+    $card.Controls.Add($script:lblMouseMoverCountdown)
+
+    $script:btnMouseMoverStart = New-Object System.Windows.Forms.Button
+    $script:btnMouseMoverStart.Text = 'Start Mouse Mover'
+    $script:btnMouseMoverStart.Size = New-Object System.Drawing.Size(190, 34)
+    $script:btnMouseMoverStart.Location = New-Object System.Drawing.Point(18, 166)
+    $script:btnMouseMoverStart.FlatStyle = 'Flat'
+    $script:btnMouseMoverStart.BackColor = [System.Drawing.Color]::FromArgb(88, 140, 100)
+    $script:btnMouseMoverStart.ForeColor = [System.Drawing.Color]::White
+    $card.Controls.Add($script:btnMouseMoverStart)
+
+    $script:btnMouseMoverStop = New-Object System.Windows.Forms.Button
+    $script:btnMouseMoverStop.Text = 'Stop Mouse Mover'
+    $script:btnMouseMoverStop.Size = New-Object System.Drawing.Size(190, 34)
+    $script:btnMouseMoverStop.Location = New-Object System.Drawing.Point(216, 166)
+    $script:btnMouseMoverStop.FlatStyle = 'Flat'
+    $script:btnMouseMoverStop.BackColor = [System.Drawing.Color]::FromArgb(156, 77, 77)
+    $script:btnMouseMoverStop.ForeColor = [System.Drawing.Color]::White
+    $card.Controls.Add($script:btnMouseMoverStop)
+
+    $script:btnMouseMoverNow = New-Object System.Windows.Forms.Button
+    $script:btnMouseMoverNow.Text = 'Move Mouse Now (One Burst)'
+    $script:btnMouseMoverNow.Size = New-Object System.Drawing.Size(240, 34)
+    $script:btnMouseMoverNow.Location = New-Object System.Drawing.Point(414, 166)
+    $script:btnMouseMoverNow.FlatStyle = 'Flat'
+    $script:btnMouseMoverNow.BackColor = [System.Drawing.Color]::FromArgb(84, 120, 172)
+    $script:btnMouseMoverNow.ForeColor = [System.Drawing.Color]::White
+    $card.Controls.Add($script:btnMouseMoverNow)
+
+    $script:btnMouseMoverStart.Add_Click({
+        Set-SuperUserMouseMoverState -Enabled $true
+    })
+    $script:btnMouseMoverStop.Add_Click({
+        Set-SuperUserMouseMoverState -Enabled $false
+    })
+    $script:btnMouseMoverNow.Add_Click({
+        Invoke-SuperUserMouseMoveBurstOnce
+    })
+
+    if (-not $script:mouseBurstTimer) {
+        $script:mouseBurstTimer = New-Object System.Windows.Forms.Timer
+        $script:mouseBurstTimer.Interval = [int]($script:MouseMoveIntervalSeconds * 1000)
+        $script:mouseBurstTimer.Add_Tick({
+            if (-not $script:MouseMoverEnabled) { return }
+            $script:MouseMoveBurstEnd = (Get-Date).AddSeconds($script:MouseMoveDurationSeconds)
+            $script:MouseMoveNextAt = (Get-Date).AddSeconds($script:MouseMoveIntervalSeconds)
+            if ($script:mouseStepTimer) {
+                $script:mouseStepTimer.Interval = [int]$script:MouseMoveStepMilliseconds
+                $script:mouseStepTimer.Start()
+            }
+            Update-SuperUserUi
+        })
+    }
+
+    if (-not $script:mouseStepTimer) {
+        $script:mouseStepTimer = New-Object System.Windows.Forms.Timer
+        $script:mouseStepTimer.Interval = [int]$script:MouseMoveStepMilliseconds
+        $script:mouseStepTimer.Add_Tick({
+            if ((-not $script:MouseMoverEnabled) -and (-not $script:MouseMoveSingleBurstActive)) {
+                $script:mouseStepTimer.Stop()
+                return
+            }
+            if (-not $script:MouseMoveBurstEnd -or (Get-Date) -ge $script:MouseMoveBurstEnd) {
+                $script:mouseStepTimer.Stop()
+                $script:MouseMoveSingleBurstActive = $false
+                Update-SuperUserUi
+                return
+            }
+            $point = New-Object MouseInterop+POINT
+            [void][MouseInterop]::GetCursorPos([ref]$point)
+            $dx = $script:MouseMoverRandom.Next(-$script:MouseMoveMaxStepPixels, $script:MouseMoveMaxStepPixels + 1)
+            $dy = $script:MouseMoverRandom.Next(-$script:MouseMoveMaxStepPixels, $script:MouseMoveMaxStepPixels + 1)
+            [void][MouseInterop]::SetCursorPos(($point.X + $dx), ($point.Y + $dy))
+        })
+    }
+
+    if (-not $script:mouseCountdownTimer) {
+        $script:mouseCountdownTimer = New-Object System.Windows.Forms.Timer
+        $script:mouseCountdownTimer.Interval = 250
+        $script:mouseCountdownTimer.Add_Tick({
+            if ($script:MouseMoverEnabled) {
+                Update-SuperUserUi
+            }
+        })
+    }
+
+    Update-SuperUserUi
+    [void]$TabControl.TabPages.Add($script:tabSuperUser)
+    $script:SuperUserTabCreated = $true
+    return $script:tabSuperUser
+}
+
 function Initialize-SecretTab {
     param(
         [Parameter(Mandatory)] [System.Windows.Forms.TabControl]$TabControl
@@ -1314,6 +1903,9 @@ function Initialize-SecretTab {
 
     if (-not $script:CookieUpgrades) {
         Initialize-CookieUpgrades
+    }
+    if (-not $script:CookieOverflowUpgrades -or $script:CookieOverflowUpgrades.Count -eq 0) {
+        Initialize-CookieOverflowUpgrades
     }
 
     if ($script:SecretTabCreated -and $script:tabSecret) {
@@ -1335,7 +1927,7 @@ function Initialize-SecretTab {
     $script:tabSecret.Controls.Add($pnlSecretHeader)
 
     $lblSecretTitle = New-Object System.Windows.Forms.Label
-    $lblSecretTitle.Text = "Joe's Cookie Clicker"
+    $lblSecretTitle.Text = "Insert app title here"
     $lblSecretTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 24)
     $lblSecretTitle.ForeColor = [System.Drawing.Color]::FromArgb(255, 235, 161)
     $lblSecretTitle.AutoSize = $true
@@ -1581,7 +2173,7 @@ function Initialize-SecretTab {
             $clickValue *= $script:CookieCritMultiplier
             Show-CookieEventBanner -Message "CRIT CLICK! +$(Format-CookieNumber -Value $clickValue)" -BackColor ([System.Drawing.Color]::FromArgb(177, 121, 68))
         }
-        $script:CookieCount += $clickValue
+        $script:CookieCount = Normalize-CookieNumber -Value ($script:CookieCount + $clickValue) -Fallback 0.0
         Update-CookieClickerUi
     })
 
@@ -1606,7 +2198,7 @@ function Initialize-SecretTab {
     $script:cookieTimer.Interval = 250
     $script:cookieTimer.Add_Tick({
         if ($script:CookiesPerSecond -gt 0) {
-            $script:CookieCount += ($script:CookiesPerSecond / 4.0)
+            $script:CookieCount = Normalize-CookieNumber -Value ($script:CookieCount + ($script:CookiesPerSecond / 4.0)) -Fallback 0.0
             Update-CookieClickerUi
         }
         if ($script:lblCookieEvent -and $script:lblCookieEvent.Visible -and $script:cookieEventHideAt -and ((Get-Date) -ge $script:cookieEventHideAt)) {
@@ -1681,6 +2273,7 @@ $tabs.Location = New-Object System.Drawing.Point(15, 92)
 $tabs.Size = New-Object System.Drawing.Size(1075, 635)
 $tabs.Anchor = 'Top, Bottom, Left, Right'
 $form.Controls.Add($tabs)
+$script:MainTabControl = $tabs
 
 # -----------------------------
 # Welcome tab
@@ -1697,7 +2290,7 @@ $welcomeCard.BackColor = [System.Drawing.Color]::White
 $tabWelcome.Controls.Add($welcomeCard)
 
 $lblWelcome = New-Object System.Windows.Forms.Label
-$lblWelcome.Text = "Welcome to Joe's System Services $($script:AdminCredential.UserName)!"
+$lblWelcome.Text = "Welcome to Joe's System Services Insert username here!"
 $lblWelcome.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 24)
 $lblWelcome.AutoSize = $true
 $lblWelcome.Location = New-Object System.Drawing.Point(28, 15)
@@ -2207,7 +2800,7 @@ $grpCreateAccount.Controls.Add($lblAcctOu)
 $txtAcctOu = New-Object System.Windows.Forms.TextBox
 $txtAcctOu.Location = New-Object System.Drawing.Point(740, 31)
 $txtAcctOu.Size = New-Object System.Drawing.Size(150, 28)
-$txtAcctOu.Text = 'PLACEHOLDER'
+$txtAcctOu.Text = 'Insert whatever you want here!'
 $grpCreateAccount.Controls.Add($txtAcctOu)
 
 $lblAcctPassword = New-Object System.Windows.Forms.Label
@@ -2219,7 +2812,7 @@ $grpCreateAccount.Controls.Add($lblAcctPassword)
 $txtAcctPassword = New-Object System.Windows.Forms.TextBox
 $txtAcctPassword.Location = New-Object System.Drawing.Point(140, 74)
 $txtAcctPassword.Size = New-Object System.Drawing.Size(220, 28)
-$txtAcctPassword.Text = 'Enter Password HERE'
+$txtAcctPassword.Text = 'DEFAULTPASSWORD123'
 $grpCreateAccount.Controls.Add($txtAcctPassword)
 
 $lblAcctDomain = New-Object System.Windows.Forms.Label
@@ -2231,7 +2824,7 @@ $grpCreateAccount.Controls.Add($lblAcctDomain)
 $txtAcctDomain = New-Object System.Windows.Forms.TextBox
 $txtAcctDomain.Location = New-Object System.Drawing.Point(475, 74)
 $txtAcctDomain.Size = New-Object System.Drawing.Size(250, 28)
-$txtAcctDomain.Text = 'DC=PLACEHOLDER,DC=secure'
+$txtAcctDomain.Text = 'DC=,DC='
 $grpCreateAccount.Controls.Add($txtAcctDomain)
 
 $btnCreateAccount = New-Object System.Windows.Forms.Button
@@ -3214,8 +3807,20 @@ $btnApplyTheme.Add_Click({
         $tabs.SelectedTab = $secretTab
         $script:SecretUnlocked = $true
         Save-CurrentProfileSettings
-        Write-Log "Easter egg unlocked: Joe's Cookie Clicker is now available." -Level Success
-        Show-Info "Secret tab unlocked! Joe's Cookie Clicker is live."
+        Write-Log "Easter egg unlocked: Insert feature name here is now available." -Level Success
+        Show-Info "Secret tab unlocked! Insert feature name here is live."
+    }
+})
+
+$btnThemePreviewPrimary.Add_Click({
+    $script:PrimaryActionClickCount++
+    if ((-not $script:SuperUserUnlocked) -and ($script:PrimaryActionClickCount -ge 7)) {
+        $superUserTab = Initialize-SuperUserTab -TabControl $tabs
+        $tabs.SelectedTab = $superUserTab
+        $script:SuperUserUnlocked = $true
+        Save-CurrentProfileSettings
+        Write-Log 'Super User controls unlocked from Settings Primary Action button clicks.' -Level Success
+        Show-Info 'Super User tab unlocked! Hidden controls are now available.'
     }
 })
 
@@ -3438,14 +4043,14 @@ $btnCreateAccount.Add_Click({
     }
 
     $previewInitial = $first.Substring(0, 1)
-    $previewUser = if ($ou.ToLower() -eq 'PLACEHOLDER') {
+    $previewUser = if ($ou.ToLower() -eq 'PLACEHOLDER for your own OU here!') {
         ("{0}{1}" -f $last, $previewInitial.ToLower()).ToLower()
     }
     else {
         ("{0}{1}_{2}" -f $last, $previewInitial, $ou.ToLower()).ToLower()
     }
-    $previewDisplay = if ($ou.ToLower() -eq 'PLACEHOLDER') { "$first $last" } else { "$first $last ($($ou.ToLower()))" }
-    $previewEmail = "PLACEHOLDER"
+    $previewDisplay = if ($ou.ToLower() -eq 'Placeholder for your own OU here!') { "$first $last" } else { "$first $last ($($ou.ToLower()))" }
+    $previewEmail = "$previewUser@Insert domain here"
 
     $ok = Show-YesNo "Create '$previewDisplay' with username '$previewUser' and email '$previewEmail'?"
     if ($ok -ne [System.Windows.Forms.DialogResult]::Yes) {
@@ -3559,7 +4164,7 @@ $btnEnableBL.Add_Click({
         $txtBLFile.Text = [string]$result.FileContent
         $btnBLReboot.Enabled = $true
 
-        Write-Log "BitLocker workflow completed on $computer. Output moved to PLACEHOLDER and recovery key displayed." -Level Success
+        Write-Log "BitLocker workflow completed on $computer. Output moved to Insert network share path here and recovery key displayed." -Level Success
 
         $prompt = Show-YesNo "Check the above key. Proceed with rebooting machine?"
         if ($prompt -eq [System.Windows.Forms.DialogResult]::Yes) {
@@ -3641,6 +4246,15 @@ $form.Add_FormClosing({
         if ($script:cookieTimer) {
             $script:cookieTimer.Stop()
         }
+        if ($script:mouseStepTimer) {
+            $script:mouseStepTimer.Stop()
+        }
+        if ($script:mouseBurstTimer) {
+            $script:mouseBurstTimer.Stop()
+        }
+        if ($script:mouseCountdownTimer) {
+            $script:mouseCountdownTimer.Stop()
+        }
         Save-CurrentProfileSettings
     }
     catch {
@@ -3648,7 +4262,7 @@ $form.Add_FormClosing({
     }
 })
 
-Write-Log "Joe's System Services launched for $($script:AdminCredential.UserName)." -Level Success
+Write-Log "Joe's System Services launched for Insert username here." -Level Success
 $tabs.SelectedTab = $tabWelcome
 
 [void]$form.ShowDialog()
